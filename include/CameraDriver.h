@@ -101,6 +101,7 @@ public:
     virtual void queryStatus() {}
     virtual void sendHeartbeat() {}
     virtual bool shouldDisconnect() const { return false; }
+    virtual uint32_t getLastTelemetryMs() const { return 0; }
 
     // Telemetry & State
     virtual const CameraTelemetry& getTelemetry() const = 0;

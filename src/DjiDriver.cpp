@@ -108,6 +108,8 @@ DjiDriver::DjiDriver()
     , m_needsDisconnect(false)
     , m_sleepRequestedMs(0)
     , m_sleepPending(false)
+    , m_lastPowerMode(0)
+    , m_lastCamStatus(0)
 {
     memset(&m_telemetry, 0, sizeof(m_telemetry));
     m_telemetry.state = CAM_DISCONNECTED;
@@ -249,7 +251,7 @@ void DjiDriver::sendPacketWithSeq(uint8_t cmdType, uint8_t cmdSet, uint8_t cmdId
     strncpy(m_telemetry.lastHexPacket, hex, sizeof(m_telemetry.lastHexPacket) - 1);
     m_telemetry.packetCount++;
 
-    // Write to FFF5 characteristic (without response)
+    // Write to FFF5 characteristic (without response per DJI R-SDK spec)
     m_writeFn(0xFFF5, buf, totalLen, false);
 }
 
@@ -264,6 +266,10 @@ bool DjiDriver::onConnected(uint16_t connHandle, BleWriteFunc writeFn) {
     m_connHandle = connHandle;
     m_writeFn = writeFn;
     m_telemetry.state = CAM_CONNECTING;
+    m_telemetry.batteryPercent = 0;
+    m_telemetry.packetCount = 0;
+    m_lastPowerMode = 0;
+    m_lastCamStatus = 0;
     m_seq = 1;
     m_lastTelemetryMs = millis();
     m_lastRetryMs = millis();
@@ -289,6 +295,8 @@ void DjiDriver::onDisconnected() {
     m_sleepPending = false;
     m_sleepRequestedMs = 0;
     m_lastRetryMs = 0;
+    m_lastPowerMode = 0;
+    m_lastCamStatus = 0;
 }
 
 void DjiDriver::sendPairingHandshake(uint8_t verifyMode) {
@@ -422,7 +430,7 @@ void DjiDriver::setPushMode(uint8_t pushMode) {
     DjiStatusSubscription req{};
     req.push_mode = pushMode; // 3 = Periodic 2Hz + status change
     req.push_freq = 20;       // 2.0 Hz
-    sendPacket(0x00, 0x1D, 0x05, (const uint8_t*)&req, sizeof(req)); // 0x00 = NO_ACK per spec
+    sendPacket(0x00, 0x1D, 0x05, (const uint8_t*)&req, sizeof(req)); // 0x00 = NO_ACK per DJI R-SDK spec
 }
 
 void DjiDriver::sendRawHex(const uint8_t* bytes, size_t len) {
@@ -503,15 +511,15 @@ void DjiDriver::parseTelemetryPayload(const uint8_t* payload, size_t len) {
             m_telemetry.batteryPercent = p->camera_bat_percentage;
         }
 
+        m_lastPowerMode = p->power_mode;
+        m_lastCamStatus = p->camera_status;
+
         // Recording Status (Byte 1: 0x03 = Shooting / Recording in progress)
         m_telemetry.isRecording = (p->camera_status == 0x03);
         if (p->power_mode == 3) {
             m_telemetry.state = CAM_SLEEPING;
             m_telemetry.isRecording = false;
-            if (!m_sleepPending) {
-                m_sleepPending = true;
-                m_sleepRequestedMs = millis();
-            }
+            m_needsDisconnect = true;
         } else {
             m_telemetry.state = m_telemetry.isRecording ? CAM_RECORDING : CAM_PAIRED;
         }
@@ -575,6 +583,7 @@ void DjiDriver::parseTelemetryPayload(const uint8_t* payload, size_t len) {
     } else if (len >= 6) {
         // Fallback for partial packets
         uint8_t status = payload[1];
+        m_lastCamStatus = status;
         m_telemetry.isRecording = (status == 0x03);
         m_telemetry.state = m_telemetry.isRecording ? CAM_RECORDING : CAM_PAIRED;
         if (len >= 7) {
@@ -593,6 +602,14 @@ void DjiDriver::updateLoop(uint32_t nowMs) {
         m_needsDisconnect = true;
     }
 
+    // Handshake Retry while connecting
+    if (m_telemetry.state == CAM_CONNECTING) {
+        if (nowMs - m_lastTelemetryMs >= 800 && nowMs - m_lastRetryMs >= 800) {
+            m_lastRetryMs = nowMs;
+            sendPairingHandshake(0);
+        }
+    }
+
     // 1. Reply to Camera Counter-Request (Step 4 of Handshake)
     if (m_pendingCameraConnAck) {
         m_pendingCameraConnAck = false;
@@ -604,25 +621,25 @@ void DjiDriver::updateLoop(uint32_t nowMs) {
     }
 
     // 2. Post-Auth Initialization: Subscribe to 2Hz live telemetry push immediately
-    if (m_postAuthInitNeeded && (nowMs - m_postAuthMs >= 50)) {
+    if (m_postAuthInitNeeded && (nowMs - m_postAuthMs >= 300)) {
         m_postAuthInitNeeded = false;
         m_telemetry.state = CAM_PAIRED;
+        m_lastRetryMs = nowMs;
         setPushMode(0x03); // Subscribe to 2 Hz live telemetry push
     }
 
-    // 3. Keep-Alive, Telemetry Retry & Sleep Detection Watchdog:
-    // When connected, 2Hz telemetry arrives every 500ms.
-    if (m_telemetry.state >= CAM_PAIRED && m_lastTelemetryMs > 0) {
-        // Retry subscribing to 2Hz telemetry if no telemetry received after 5 seconds
-        if (nowMs - m_lastTelemetryMs > 5000 && nowMs - m_lastRetryMs > 5000) {
+    // 3. Keep-Alive & Telemetry Retry Watchdog:
+    // Once paired, retry setPushMode until live telemetry arrives (batteryPercent > 0),
+    // then retry if telemetry pauses for > 2 seconds.
+    if (m_telemetry.state >= CAM_PAIRED) {
+        if (m_telemetry.batteryPercent == 0) {
+            if (nowMs - m_lastRetryMs >= 1000) {
+                m_lastRetryMs = nowMs;
+                setPushMode(0x03);
+            }
+        } else if (m_lastTelemetryMs > 0 && (nowMs - m_lastTelemetryMs > 2000) && (nowMs - m_lastRetryMs >= 2000)) {
             m_lastRetryMs = nowMs;
             setPushMode(0x03);
-        }
-        // If silent for >15000ms, camera is off/asleep -> mark CAM_SLEEPING and signal disconnect
-        if (nowMs - m_lastTelemetryMs > 15000) {
-            m_telemetry.state = CAM_SLEEPING;
-            m_telemetry.isRecording = false;
-            m_needsDisconnect = true; // Signal main loop to tear down dead link
         }
     }
 }

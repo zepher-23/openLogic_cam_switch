@@ -23,6 +23,14 @@
 
 #pragma GCC diagnostic ignored "-Wvolatile"
 
+#ifndef STATUS_LED_PIN
+#define STATUS_LED_PIN 8
+#endif
+
+#ifndef STATUS_LED_ACTIVE_LOW
+#define STATUS_LED_ACTIVE_LOW 1
+#endif
+
 // ============================================================================
 // Configuration Constants
 // ============================================================================
@@ -63,13 +71,11 @@ enum CmdType {
     CMD_CLEAR_MAC,
     CMD_SAVE_DEFAULT,
     CMD_CLEAR_LOGS,
-    CMD_BF_BRIDGE_TOGGLE,
-    CMD_ENTER_TCP_BRIDGE,
-    CMD_EXIT_TCP_BRIDGE,
+    CMD_START_FLIGHT_MODE,
+    CMD_ENTER_BF_BLE,
     CMD_SET_AUTO_ARM,
     CMD_SET_DISARM_DELAY,
-    CMD_SET_AUX_CHANNEL,
-    CMD_SET_WIFI_OFF_ARM
+    CMD_SET_AUX_CHANNEL
 };
 
 struct CommandItem {
@@ -80,16 +86,28 @@ struct CommandItem {
 
 static QueueHandle_t g_cmdQueue = nullptr;
 static uint32_t s_disarmTargetMs = 0;
-static bool s_autoRecStarted = false;
+static bool s_armRecStarted = false;
+static bool s_auxRecStarted = false;
 
 // Persistent Settings & Operating Mode
-static bool g_bridgeMode = false;
+enum BootMode : uint8_t {
+    MODE_FLIGHT = 0,
+    MODE_WIFI_SETUP = 1,
+    MODE_BF_BLE_BRIDGE = 2
+};
+static BootMode g_bootMode = MODE_FLIGHT;
+static uint32_t g_bootMs = 0;
+static bool g_autoWifiCancelled = false;
 static bool g_autoRecOnArm = true;
 static uint8_t g_disarmDelaySec = 3;
 static uint8_t g_auxRecChannel = 0;
-static bool g_wifiOffOnArm = false;
-static bool g_wifiSuspended = false;
-static uint32_t g_wifiRestoreAtMs = 0;
+
+// Betaflight BLE NUS Handles & State
+static NimBLECharacteristic* pNusTxChar = nullptr;
+static NimBLECharacteristic* pNusRxChar = nullptr;
+static volatile bool g_bfBleConnected = false;
+static uint16_t g_bfBleConnHandle = 0;
+static uint16_t g_bfBleMtu = 23;
 
 static bool enqueueCommand(CmdType type, uint8_t value = 0, uint16_t extra = 0) {
     if (!g_cmdQueue) return false;
@@ -143,13 +161,64 @@ static bool hasTargetAddress = false;
 static bool hasSavedMacForActiveBrand = false;
 static uint32_t lastScanRestartMs = 0;
 
+// Deferred MAC Save State
+static bool s_macSavedThisSession = false;
+static uint32_t s_instaMacSaveAtMs = 0;
+static NimBLEAddress s_pendingInstaAddr;
+
 // Reboot-to-Switch State
 static bool g_pendingRestart = false;
 static uint32_t g_restartTargetMs = 0;
 
 // Host-Task Thread-Safety Flags
 static volatile bool g_disconnectPending = false;
+static volatile int g_lastDisconnectReason = 0;
+static uint32_t g_bleScanAllowedAfterMs = 0;
 static volatile uint32_t g_telemetryVersion = 1;
+static bool g_explicitSleepRequested = false;
+static bool g_cameraAsleep = false;
+static bool g_pendingRecordOnWake = false;
+static uint32_t g_pendingRecordExpireMs = 0;
+static bool s_hadDisconnectThisBoot = false;
+static bool s_diagPairedLoggedThisSession = false;
+static uint32_t g_camPairedAtMs = 0;
+static uint32_t g_lastDisconnectMs = 0;
+static uint32_t s_cameraConnBackoffUntilMs = 0;
+
+// 6-Event Diagnostics Trail (Flushed to NVS on disconnect)
+static char s_diagLines[6][64];
+static uint8_t s_diagCount = 0;
+
+static void flushDiagHistoryToNvs() {
+    if (s_diagCount > 0 && g_bootMode == MODE_FLIGHT) {
+        String joined = "";
+        for (uint8_t i = 0; i < s_diagCount; i++) {
+            if (i > 0) joined += "\n";
+            joined += s_diagLines[i];
+        }
+        prefs.putString("diag_hist", joined);
+    }
+}
+
+static void appendDiagEvent(const char* line, bool flushToNvs) {
+    if (!line || line[0] == '\0') return;
+
+    if (s_diagCount < 6) {
+        strncpy(s_diagLines[s_diagCount], line, sizeof(s_diagLines[0]) - 1);
+        s_diagLines[s_diagCount][sizeof(s_diagLines[0]) - 1] = '\0';
+        s_diagCount++;
+    } else {
+        for (uint8_t i = 0; i < 5; i++) {
+            memcpy(s_diagLines[i], s_diagLines[i + 1], sizeof(s_diagLines[0]));
+        }
+        strncpy(s_diagLines[5], line, sizeof(s_diagLines[0]) - 1);
+        s_diagLines[5][sizeof(s_diagLines[0]) - 1] = '\0';
+    }
+
+    if (flushToNvs) {
+        flushDiagHistoryToNvs();
+    }
+}
 
 // WKP Wake Broadcast State
 static bool isBroadcastingWake = false;
@@ -158,7 +227,9 @@ static uint32_t wakeBroadcastStartMs = 0;
 // Non-Blocking Connection State Machine
 enum ConnStep {
     CONN_IDLE,
+    CONN_BOOT_WAIT,
     CONN_INITIATE,
+    CONN_AWAIT_CONNECT,
     CONN_AWAIT_SETTLE,
     CONN_SECURE,
     CONN_RESOLVE_CHARS,
@@ -201,16 +272,18 @@ static void addLog(const char* tag, const char* msg) {
     logHead++;
     portEXIT_CRITICAL(&g_logMux);
 
-    // Note: Do not print to Serial here because Serial (USB CDC COM7) is used
-    // as a transparent serial passthrough bridge for Betaflight Configurator.
-    // Logs are streamed in real time via WebSocket and available on the Web UI.
+    // Mirror to USB Serial (115200 baud) for live terminal diagnostics
+    if (Serial && Serial.availableForWrite() >= 96) {
+        Serial.printf("[%lu][%s] %s\r\n", (unsigned long)now, tag ? tag : "SYS", msg ? msg : "");
+    }
 }
 
 // Forward Declarations
 static void startBleScan();
-static void selectCameraBrand(CameraBrand brand, bool reboot = true);
+static void selectCameraBrand(CameraBrand brand, bool reboot = false);
 static void startWkpWakeBroadcast();
 static void stopWkpWakeBroadcast();
+static void configureNusAdvertising();
 static void clearSavedMacActiveBrand();
 
 // ============================================================================
@@ -270,9 +343,19 @@ static void saveActiveBrandMac(const NimBLEAddress& addr) {
     portEXIT_CRITICAL(&g_telemetryMux);
 
     const char* key = getBrandMacKey(g_activeBrand);
-    prefs.putBytes(key, msbMac, 6);
     char typeKey[20];
     snprintf(typeKey, sizeof(typeKey), "%s_t", key);
+
+    uint8_t existingMac[6] = {0};
+    size_t existingLen = prefs.getBytes(key, existingMac, 6);
+    uint8_t existingType = prefs.getUChar(typeKey, 0xFF);
+
+    if (existingLen == 6 && memcmp(existingMac, msbMac, 6) == 0 && existingType == addr.getType()) {
+        hasSavedMacForActiveBrand = true;
+        return;
+    }
+
+    prefs.putBytes(key, msbMac, 6);
     prefs.putUChar(typeKey, addr.getType());
     hasSavedMacForActiveBrand = true;
 
@@ -313,6 +396,7 @@ static void clearSavedMacActiveBrand() {
     prefs.remove(typeKey);
     hasTargetAddress = false;
     hasSavedMacForActiveBrand = false;
+    g_cameraAsleep = false;
     uint8_t zeroMac[6] = {0};
 
     portENTER_CRITICAL(&g_telemetryMux);
@@ -320,14 +404,13 @@ static void clearSavedMacActiveBrand() {
     g_telemetryVersion++;
     portEXIT_CRITICAL(&g_telemetryMux);
 
-    if (g_activeBrand != BRAND_INSTA360) {
+    addLog("NVS", ("Cleared saved MAC for " + String(g_activeDriver->getBrandName())).c_str());
+
+    if (g_bootMode == MODE_FLIGHT && g_activeBrand != BRAND_INSTA360) {
         if (pClient && pClient->isConnected()) {
             pClient->disconnect();
         }
-        addLog("NVS", ("Cleared saved MAC for " + String(g_activeDriver->getBrandName()) + "; rescanning...").c_str());
         startBleScan();
-    } else {
-        addLog("NVS", "Cleared saved MAC for Insta360 GPS Remote");
     }
 }
 
@@ -376,9 +459,19 @@ class ClientCallbacks : public NimBLEClientCallbacks {
 
     void onDisconnect(NimBLEClient* client, int reason) override {
         // Defer state mutation and scan restart to loopTask
+        g_lastDisconnectReason = reason;
         g_disconnectPending = true;
     }
+
+    bool onConnParamsUpdateRequest(NimBLEClient* client, const ble_gap_upd_params* params) override {
+        if (params && params->supervision_timeout < 200) {
+            return false;
+        }
+        return true;
+    }
 };
+
+static ClientCallbacks s_clientCallbacks;
 
 static void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
     if (!pData || length == 0) return;
@@ -461,6 +554,22 @@ class ScanCallbacks : public NimBLEScanCallbacks {
     void onDiscovered(const NimBLEAdvertisedDevice* advertisedDevice) override {
         if (connStep != CONN_IDLE || (pClient && pClient->isConnected())) return;
 
+        uint32_t now = millis();
+        if ((int32_t)(now - s_cameraConnBackoffUntilMs) < 0) return;
+
+        // Ignore raw standby/manufacturer beacons from sleeping cameras.
+        // Only initiate connection if the camera is actively broadcasting its name or service.
+        bool isAwakeAdv = false;
+        if (advertisedDevice->haveName() && !advertisedDevice->getName().empty()) {
+            isAwakeAdv = true;
+        } else if (advertisedDevice->isAdvertisingService(NimBLEUUID((uint16_t)0xFFF0)) ||
+                   advertisedDevice->isAdvertisingService(NimBLEUUID((uint16_t)0xFEA6))) {
+            isAwakeAdv = true;
+        }
+        if (!isAwakeAdv) {
+            return;
+        }
+
         NimBLEAddress addr = advertisedDevice->getAddress();
 
         // 1. If saved MAC exists for active brand, prioritize matching that MAC immediately
@@ -470,7 +579,10 @@ class ScanCallbacks : public NimBLEScanCallbacks {
                 char buf[64];
                 snprintf(buf, sizeof(buf), "Matched saved %s [%s]", g_activeDriver->getBrandName(), addr.toString().c_str());
                 addLog("SCAN", buf);
-                NimBLEDevice::getScan()->stop();
+                char diagEvt[32];
+                snprintf(diagEvt, sizeof(diagEvt), "S@%lu", (unsigned long)now);
+                appendDiagEvent(diagEvt, false);
+                connStateTimerMs = now;
                 connStep = CONN_INITIATE;
                 portENTER_CRITICAL(&g_telemetryMux);
                 g_telemetryVersion++;
@@ -504,9 +616,12 @@ class ScanCallbacks : public NimBLEScanCallbacks {
                      advertisedDevice->getRSSI());
             addLog("SCAN", logMsg);
 
-            NimBLEDevice::getScan()->stop();
             targetAddress = addr;
             hasTargetAddress = true;
+            char diagEvt[32];
+            snprintf(diagEvt, sizeof(diagEvt), "S@%lu", (unsigned long)now);
+            appendDiagEvent(diagEvt, false);
+            connStateTimerMs = now;
             connStep = CONN_INITIATE;
             portENTER_CRITICAL(&g_telemetryMux);
             g_telemetryVersion++;
@@ -515,15 +630,30 @@ class ScanCallbacks : public NimBLEScanCallbacks {
     }
 };
 
+static uint32_t s_bfBleConnAtMs = 0;
+static bool s_bfParamsUpdated = false;
+
 // ============================================================================
-// BLE Server Callbacks (Insta360 Peripheral Server)
+// BLE Server Callbacks (Insta360 Peripheral Server & Betaflight NUS Server)
 // ============================================================================
 class UnifiedServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
-        if (g_activeBrand == BRAND_INSTA360) {
+        uint16_t handle = connInfo.getConnHandle();
+        if (g_bootMode == MODE_BF_BLE_BRIDGE || (g_bootMode == MODE_FLIGHT && g_activeBrand != BRAND_INSTA360)) {
+            g_bfBleConnected = true;
+            g_bfBleConnHandle = handle;
+            g_bfBleMtu = connInfo.getMTU() > 0 ? connInfo.getMTU() : 23;
+            g_bfBridge.setBleConnected(true);
+            g_bfBridge.setBleMtu(g_bfBleMtu);
+            g_autoWifiCancelled = true;
+            s_bfBleConnAtMs = millis();
+            s_bfParamsUpdated = false;
+            addLog("BF_BLE", "Betaflight Configurator connected over BLE");
+            g_telemetryVersion++;
+        } else if (g_activeBrand == BRAND_INSTA360) {
             addLog("BLE", "Insta360 camera connected to GPS Remote");
             g_instaConnected = true;
-            g_stagedInstaConnHandle = connInfo.getConnHandle();
+            g_stagedInstaConnHandle = handle;
             g_stagedInstaAddr = connInfo.getAddress();
             g_instaConnectPending = true;
         }
@@ -531,11 +661,43 @@ class UnifiedServerCallbacks : public NimBLEServerCallbacks {
 
     void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
         uint16_t handle = connInfo.getConnHandle();
+        if (g_bfBleConnected && (handle == g_bfBleConnHandle || g_bfBleConnHandle == 0)) {
+            addLog("BF_BLE", "Betaflight Configurator disconnected from BLE");
+            g_bfBleConnected = false;
+            g_bfBleConnHandle = 0;
+            g_bfBleMtu = 23;
+            s_bfBleConnAtMs = 0;
+            s_bfParamsUpdated = false;
+            g_bfBridge.setBleConnected(false);
+            g_telemetryVersion++;
+            if (g_bootMode == MODE_BF_BLE_BRIDGE) {
+                NimBLEDevice::getAdvertising()->start();
+            }
+        }
         if (g_activeBrand == BRAND_INSTA360 && handle == g_instaConnHandle) {
             addLog("BLE", "Insta360 camera disconnected");
             g_instaConnected = false;
             g_instaConnHandle = 0;
             g_disconnectPending = true;
+        }
+    }
+
+    void onMTUChange(uint16_t MTU, NimBLEConnInfo& connInfo) override {
+        if (g_bfBleConnected && connInfo.getConnHandle() == g_bfBleConnHandle) {
+            g_bfBleMtu = MTU;
+            g_bfBridge.setBleMtu(MTU);
+            char buf[48];
+            snprintf(buf, sizeof(buf), "Betaflight BLE MTU updated to %u", (unsigned)MTU);
+            addLog("BF_BLE", buf);
+        }
+    }
+
+    void onConnParamsUpdate(NimBLEConnInfo& connInfo) override {
+        if (g_bfBleConnected && connInfo.getConnHandle() == g_bfBleConnHandle) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "Betaflight BLE interval negotiated to %.2f ms (latency=%u)",
+                     connInfo.getConnInterval() * 1.25f, (unsigned)connInfo.getConnLatency());
+            addLog("BF_BLE", buf);
         }
     }
 };
@@ -552,13 +714,170 @@ class InstaCharCallbacks : public NimBLECharacteristicCallbacks {
     }
 };
 
+class BfNusTxCallbacks : public NimBLECharacteristicCallbacks {
+    void onSubscribe(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo, uint16_t subValue) override {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Betaflight Configurator subscribed to TX (subValue=%u)", (unsigned)subValue);
+        addLog("BF_BLE", buf);
+
+        if (subValue > 0 && pServer) {
+            // Request OS-compliant low-latency interval: 7.5ms min, 15ms max, 0 latency, 4s timeout
+            pServer->updateConnParams(connInfo.getConnHandle(), 6, 12, 0, 400);
+            s_bfParamsUpdated = true;
+            addLog("BF_BLE", "Fast BLE connection interval (7.5ms-15ms) requested for zero-lag telemetry");
+        }
+    }
+};
+
+class BfNusRxCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
+        NimBLEAttValue val = pCharacteristic->getValue();
+        if (val.length() > 0) {
+            g_bfBridge.pushBleRx(val.data(), val.length());
+        }
+    }
+};
+
+static bool bfBleTxCallback(const uint8_t* data, size_t len) {
+    if (!g_bfBleConnected || !pNusTxChar || !data || len == 0) return false;
+    return pNusTxChar->notify(data, len, g_bfBleConnHandle);
+}
+
+static void recordFirstDisconnect(const char* src, int reason, uint32_t nowMs) {
+    if (g_bootMode != MODE_FLIGHT) return;
+
+    CameraTelemetry t{};
+    if (g_activeDriver) {
+        portENTER_CRITICAL(&g_telemetryMux);
+        t = g_activeDriver->getTelemetry();
+        portEXIT_CRITICAL(&g_telemetryMux);
+    }
+    uint8_t pm = (g_activeBrand == BRAND_DJI) ? g_djiDriver.getLastPowerMode() : 0;
+    uint8_t cs = (g_activeBrand == BRAND_DJI) ? g_djiDriver.getLastCamStatus() : 0;
+
+    char diagEvt[64];
+    snprintf(diagEvt, sizeof(diagEvt), "D@%lu %s r=0x%X st=%u pm=%u cs=%u pkt=%lu",
+             (unsigned long)nowMs, src ? src : "UNK", (unsigned)reason, (unsigned)t.state,
+             (unsigned)pm, (unsigned)cs, (unsigned long)t.packetCount);
+    appendDiagEvent(diagEvt, true);
+}
+
+static const char* const NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+
+static void configureNusAdvertising() {
+    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+    if (!pAdv) return;
+
+    if (pAdv->isAdvertising()) {
+        pAdv->stop();
+    }
+    pAdv->reset();
+    pAdv->setConnectableMode(BLE_GAP_CONN_MODE_UND);
+    pAdv->enableScanResponse(true);
+
+    NimBLEAdvertisementData advData;
+    advData.setFlags(0x06);
+    advData.setCompleteServices(NimBLEUUID(NUS_SERVICE_UUID));
+
+    NimBLEAdvertisementData scanResp;
+    scanResp.setName("OpenLogic_BF");
+
+    pAdv->setAdvertisementData(advData);
+    pAdv->setScanResponseData(scanResp);
+    pAdv->setMinInterval(160);
+    pAdv->setMaxInterval(240);
+}
+
+static bool s_nusServerStarted = false;
+
+static void setupBetaflightBleServer(bool startAdv = true) {
+    if (!s_nusServerStarted) {
+        s_nusServerStarted = true;
+        if (!pServer) {
+            pServer = NimBLEDevice::createServer();
+            pServer->setCallbacks(new UnifiedServerCallbacks());
+        }
+
+        NimBLEService* pNusService = pServer->createService(NimBLEUUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E"));
+
+        pNusTxChar = pNusService->createCharacteristic(
+            NimBLEUUID("6E400003-B5A3-F393-E0A9-E50E24DCCA9E"),
+            NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+        );
+        pNusTxChar->setCallbacks(new BfNusTxCallbacks());
+
+        pNusRxChar = pNusService->createCharacteristic(
+            NimBLEUUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E"),
+            NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+        );
+        pNusRxChar->setCallbacks(new BfNusRxCallbacks());
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        pNusService->start();
+#pragma GCC diagnostic pop
+
+        pServer->start();
+
+        g_bfBridge.setBleTxCallback(bfBleTxCallback);
+
+        configureNusAdvertising();
+    }
+
+    if (startAdv) {
+        NimBLEDevice::getAdvertising()->start();
+        addLog("BF_BLE", "Betaflight NUS Server advertising 'OpenLogic_BF' (6E400001)");
+    }
+}
+
 // ============================================================================
 // Non-Blocking Connection State Machine (Central Mode)
 // ============================================================================
+static uint8_t s_resolveRetries = 0;
+
 static void runConnectionStateMachine(uint32_t now) {
+    static ConnStep s_lastLoggedConnStep = CONN_IDLE;
+    if (connStep != s_lastLoggedConnStep) {
+        if (Serial && Serial.availableForWrite() >= 96) {
+            Serial.printf("[%lu][CONN] State transition: %d -> %d\r\n", (unsigned long)now, (int)s_lastLoggedConnStep, (int)connStep);
+        }
+        s_lastLoggedConnStep = connStep;
+    }
+
     switch (connStep) {
+        case CONN_BOOT_WAIT: {
+            connStep = CONN_INITIATE;
+            g_telemetryVersion++;
+            break;
+        }
         case CONN_INITIATE: {
+            NimBLEScan* pScan = NimBLEDevice::getScan();
+            if (pScan && pScan->isScanning()) {
+                pScan->stop();
+            }
+            NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+            if (pAdv && pAdv->isAdvertising()) {
+                pAdv->stop();
+            }
+
+            s_resolveRetries = 0;
+            s_macSavedThisSession = false;
+            s_diagPairedLoggedThisSession = false;
+            g_explicitSleepRequested = false;
             addLog("BLE", ("Connecting to " + targetAddress.toString() + "...").c_str());
+
+            if (!pClient) {
+                pClient = NimBLEDevice::createClient();
+                pClient->setClientCallbacks(&s_clientCallbacks, false);
+            }
+            if (!pClient) {
+                addLog("BLE", "Failed to create BLE Client");
+                s_cameraConnBackoffUntilMs = now + 800UL;
+                connStep = CONN_IDLE;
+                g_telemetryVersion++;
+                startBleScan();
+                break;
+            }
 
             if (g_activeBrand == BRAND_GOPRO) {
                 NimBLEDevice::setSecurityAuth(BLE_SM_PAIR_AUTHREQ_BOND | BLE_SM_PAIR_AUTHREQ_SC);
@@ -567,27 +886,71 @@ static void runConnectionStateMachine(uint32_t now) {
                 NimBLEDevice::setSecurityAuth(0);
             }
 
+            pClient->setConnectionParams(12, 24, 0, 200);
+#if CONFIG_BT_NIMBLE_EXT_ADV
+            pClient->setConnectPhy(BLE_GAP_LE_PHY_1M_MASK);
+#endif
+            ble_gap_set_prefered_default_le_phy(BLE_GAP_LE_PHY_1M_MASK, BLE_GAP_LE_PHY_1M_MASK);
+
+            connStateTimerMs = now;
+            connStep = CONN_AWAIT_CONNECT;
+            g_telemetryVersion++;
+
             if (!pClient->connect(targetAddress, true, true, true)) {
                 addLog("BLE", "GATT connect initiate failed");
+                s_cameraConnBackoffUntilMs = now + 800UL;
                 connStep = CONN_IDLE;
                 g_telemetryVersion++;
                 startBleScan();
                 break;
             }
+            break;
+        }
 
-            connStateTimerMs = now;
-            connStep = CONN_AWAIT_SETTLE;
-            g_telemetryVersion++;
+        case CONN_AWAIT_CONNECT: {
+            if (pClient->isConnected()) {
+                connStateTimerMs = now;
+                connStep = CONN_AWAIT_SETTLE;
+                g_telemetryVersion++;
+            } else if (now - connStateTimerMs >= 7000) {
+                addLog("BLE", "GATT connect timed out (7000ms)");
+                pClient->cancelConnect();
+                if (pClient->isConnected()) {
+                    pClient->disconnect();
+                }
+                s_cameraConnBackoffUntilMs = now + 800UL;
+                char diagEvt[32];
+                snprintf(diagEvt, sizeof(diagEvt), "T@%lu", (unsigned long)now);
+                appendDiagEvent(diagEvt, false);
+                connStep = CONN_IDLE;
+                g_telemetryVersion++;
+                startBleScan();
+            }
             break;
         }
 
         case CONN_AWAIT_SETTLE: {
-            if (pClient->isConnected()) {
-                pClient->setConnectionParams(12, 24, 0, 150);
+            uint32_t settleDelay = (g_activeBrand == BRAND_GOPRO) ? 150 : 20;
+            if (now - connStateTimerMs >= settleDelay) {
+                if (!pClient->isConnected()) {
+                    addLog("BLE", "Link dropped during connection settle");
+                    s_cameraConnBackoffUntilMs = now + 800UL;
+                    connStep = CONN_IDLE;
+                    g_telemetryVersion++;
+                    startBleScan();
+                    break;
+                }
                 if (g_activeBrand == BRAND_GOPRO) {
                     addLog("BLE", "Securing connection for GoPro bond/encryption...");
                     if (!pClient->secureConnection()) {
+                        if (s_resolveRetries < 1) {
+                            s_resolveRetries++;
+                            connStateTimerMs = now;
+                            break;
+                        }
                         addLog("BLE", "GoPro secureConnection failed");
+                        recordFirstDisconnect("GOPRO_SEC", 0x216, now);
+                        s_cameraConnBackoffUntilMs = now + 800UL;
                         pClient->disconnect();
                         connStep = CONN_IDLE;
                         g_telemetryVersion++;
@@ -601,12 +964,6 @@ static void runConnectionStateMachine(uint32_t now) {
                     connStep = CONN_RESOLVE_CHARS;
                     g_telemetryVersion++;
                 }
-            } else if (now - connStateTimerMs >= 3000) {
-                addLog("BLE", "GATT connect timed out (3000ms)");
-                pClient->cancelConnect();
-                connStep = CONN_IDLE;
-                g_telemetryVersion++;
-                startBleScan();
             }
             break;
         }
@@ -621,13 +978,22 @@ static void runConnectionStateMachine(uint32_t now) {
 
         case CONN_RESOLVE_CHARS: {
             if (!pClient->isConnected()) {
+                s_cameraConnBackoffUntilMs = now + 800UL;
                 connStep = CONN_IDLE;
                 g_telemetryVersion++;
                 startBleScan();
                 break;
             }
             if (!resolveCameraCharacteristics()) {
+                if (s_resolveRetries < 6) {
+                    s_resolveRetries++;
+                    connStateTimerMs = now;
+                    connStep = CONN_AWAIT_SETTLE;
+                    break;
+                }
                 addLog("BLE", "Required GATT Characteristics not found");
+                recordFirstDisconnect("RESOLVE_CHAR", 0x216, now);
+                s_cameraConnBackoffUntilMs = now + 800UL;
                 pClient->disconnect();
                 connStep = CONN_IDLE;
                 g_telemetryVersion++;
@@ -654,7 +1020,7 @@ static void runConnectionStateMachine(uint32_t now) {
         }
 
         case CONN_AWAIT_CCCD: {
-            if (now - connStateTimerMs >= 100) {
+            if (now - connStateTimerMs >= 60) {
                 if (!pClient->isConnected()) {
                     connStep = CONN_IDLE;
                     g_telemetryVersion++;
@@ -668,11 +1034,18 @@ static void runConnectionStateMachine(uint32_t now) {
         }
 
         case CONN_FINALIZE: {
+            if (pClient->getMTU() < 64) {
+                pClient->exchangeMTU();
+                delay(50);
+            }
             // Never execute BLE writes / handshakes inside spinlocks!
             g_activeDriver->onConnected(pClient->getConnHandle(), bleWriteCallback);
             addLog("BLE", "Camera initialized and authenticated");
 
-            saveActiveBrandMac(targetAddress);
+            char diagEvt[64];
+            snprintf(diagEvt, sizeof(diagEvt), "C@%lu", (unsigned long)now);
+            appendDiagEvent(diagEvt, false);
+
             connStep = CONN_IDLE;
             g_telemetryVersion++;
             break;
@@ -684,26 +1057,44 @@ static void runConnectionStateMachine(uint32_t now) {
 }
 
 static void startBleScan() {
-    if (g_activeBrand == BRAND_INSTA360) return;
+    if (g_bootMode != MODE_FLIGHT || g_bfBleConnected || g_activeBrand == BRAND_INSTA360) return;
     if (isBroadcastingWake || connStep != CONN_IDLE) return;
     if (pClient && pClient->isConnected()) return;
+    if ((int32_t)(millis() - g_bleScanAllowedAfterMs) < 0) return;
 
     NimBLEScan* pScan = NimBLEDevice::getScan();
     pScan->setActiveScan(true); // Active scan so cameras advertising name/UUID in Scan Response are discovered
-    pScan->setInterval(160);     // 160ms interval
-    pScan->setWindow(32);        // 32ms window (20% duty cycle while active)
-    pScan->setMaxResults(0);
-    pScan->start(1500, false);   // Scan for 1.5 seconds then stop to yield radio to Wi-Fi
+    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+    if (pAdv && pAdv->isAdvertising()) {
+        pScan->setInterval(80);  // 80 * 0.625ms = 50ms interval
+        pScan->setWindow(40);    // 50% duty cycle: fast packet capture while coexisting with NUS adv
+    } else {
+        pScan->setInterval(48);  // 48 * 0.625ms = 30ms interval
+        pScan->setWindow(36);    // 75% duty cycle (25% radio handoff gap)
+    }
+    pScan->setMaxResults(16);
+    pScan->start(2000, false);   // Scan for 2.0 seconds then stop to yield radio
     lastScanRestartMs = millis();
 }
 
 static void selectCameraBrand(CameraBrand brand, bool reboot) {
     if (brand >= BRAND_COUNT) return;
 
+    g_activeBrand = brand;
+    g_activeDriver = g_drivers[brand];
+
+    // Load saved MAC if any for this newly selected brand
+    hasSavedMacForActiveBrand = loadSavedMacForBrand(g_activeBrand, targetAddress);
+    hasTargetAddress = hasSavedMacForActiveBrand;
+
     prefs.putUChar("brand", (uint8_t)brand);
     char buf[80];
-    snprintf(buf, sizeof(buf), "Switched brand to %s (saving to NVS)", g_drivers[brand]->getBrandName());
+    snprintf(buf, sizeof(buf), "Switched brand to %s (saved to NVS)", g_drivers[brand]->getBrandName());
     addLog("NVS", buf);
+
+    portENTER_CRITICAL(&g_telemetryMux);
+    g_telemetryVersion++;
+    portEXIT_CRITICAL(&g_telemetryMux);
 
     if (reboot) {
         addLog("SYSTEM", "Reboot scheduled in 250ms to switch BLE role cleanly...");
@@ -716,6 +1107,7 @@ static void selectCameraBrand(CameraBrand brand, bool reboot) {
 // WKP Wake Broadcast (DJI & Wake-Capable Action Cams)
 // ============================================================================
 static void startWkpWakeBroadcast() {
+    if (isBroadcastingWake) return;
     NimBLEDevice::getScan()->stop();
 
     NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
@@ -772,10 +1164,19 @@ static void startWkpWakeBroadcast() {
 
 static void stopWkpWakeBroadcast() {
     NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
-    pAdv->stop();
+    if (pAdv) {
+        pAdv->stop();
+    }
     isBroadcastingWake = false;
     addLog("WAKE", "Wake broadcast completed. Resuming scan...");
+
+    // Restore NUS advertising payload
+    if (g_bootMode == MODE_BF_BLE_BRIDGE || (g_bootMode == MODE_FLIGHT && g_activeBrand != BRAND_INSTA360)) {
+        configureNusAdvertising();
+    }
+
     if (g_activeBrand != BRAND_INSTA360) {
+        g_bleScanAllowedAfterMs = 0;
         startBleScan();
     }
 }
@@ -790,7 +1191,7 @@ static size_t buildStateJson(char* buf, size_t maxLen) {
     bool connected = false;
     bool connecting = false;
 
-    if (g_bridgeMode) {
+    if (g_bootMode != MODE_FLIGHT) {
         connected = false;
         connecting = false;
     } else if (g_activeBrand == BRAND_INSTA360) {
@@ -808,8 +1209,10 @@ static size_t buildStateJson(char* buf, size_t maxLen) {
     portEXIT_CRITICAL(&g_telemetryMux);
 
     const char* stateStr = "DISCONNECTED";
-    if (g_bridgeMode) {
-        stateStr = "TCP_BRIDGE";
+    if (g_bootMode == MODE_WIFI_SETUP) {
+        stateStr = "SETUP_MODE";
+    } else if (g_bootMode == MODE_BF_BLE_BRIDGE) {
+        stateStr = "BF_BLE_MODE";
     } else if (connected) {
         if (t.state == CAM_RECORDING) stateStr = "RECORDING";
         else if (t.state == CAM_SLEEPING) stateStr = "SLEEPING";
@@ -840,6 +1243,7 @@ static size_t buildStateJson(char* buf, size_t maxLen) {
     char escHex[140]; escapeJsonString(t.lastHexPacket, escHex, sizeof(escHex));
 
     uint16_t auxVal = (g_auxRecChannel >= 1 && g_auxRecChannel <= 8) ? g_bfBridge.getAuxChannel(g_auxRecChannel) : 0;
+    bool bfConn = g_bfBleConnected || g_bfBridge.isBleConnected();
 
     return snprintf(buf, maxLen,
         "{\"type\":\"state\",\"activeBrand\":%d,\"brandName\":\"%s\",\"stateStr\":\"%s\","
@@ -847,17 +1251,18 @@ static size_t buildStateJson(char* buf, size_t maxLen) {
         "\"resolutionFps\":\"%s\",\"stabilization\":\"%s\",\"tempStatus\":\"%s\","
         "\"recTime\":\"%s\",\"remTime\":\"%s\",\"remMB\":%lu,\"remPhotos\":%lu,"
         "\"mac\":\"%s\",\"packetCount\":%lu,\"lastHex\":\"%s\","
-        "\"bridgeMode\":%s,\"bfConnected\":%s,\"bfRxBytes\":%lu,\"bfTxBytes\":%lu,"
+        "\"bootMode\":%u,\"bridgeMode\":%s,\"bfConnected\":%s,\"bfRxBytes\":%lu,\"bfTxBytes\":%lu,"
         "\"fcConnected\":%s,\"fcArmed\":%s,\"auxValue\":%u,\"autoRecArm\":%s,"
-        "\"disarmDelaySec\":%u,\"auxRecCh\":%u,\"wifiOffArm\":%s}",
+        "\"disarmDelaySec\":%u,\"auxRecCh\":%u}",
         (int)brand, brandName, stateStr,
         t.isRecording ? "true" : "false",
         t.batteryPercent, escMode, escFps, escEis, escTemp,
         recTimeStr, remTimeStr,
         (unsigned long)t.remainCapacityMB, (unsigned long)t.remainPhotos,
         t.cameraMac, (unsigned long)t.packetCount, escHex,
-        g_bridgeMode ? "true" : "false",
-        g_bfBridge.isTcpConnected() ? "true" : "false",
+        (unsigned)g_bootMode,
+        (g_bootMode == MODE_BF_BLE_BRIDGE) ? "true" : "false",
+        bfConn ? "true" : "false",
         (unsigned long)g_bfBridge.getRxBytes(),
         (unsigned long)g_bfBridge.getTxBytes(),
         g_bfBridge.isFcConnected() ? "true" : "false",
@@ -865,8 +1270,7 @@ static size_t buildStateJson(char* buf, size_t maxLen) {
         (unsigned)auxVal,
         g_autoRecOnArm ? "true" : "false",
         (unsigned)g_disarmDelaySec,
-        (unsigned)g_auxRecChannel,
-        g_wifiOffOnArm ? "true" : "false"
+        (unsigned)g_auxRecChannel
     );
 }
 
@@ -889,7 +1293,7 @@ struct StateSnapshot {
     CameraState state;
     bool isConnected;
     CameraBrand brand;
-    bool bridgeMode;
+    uint8_t bootMode;
     bool bfConnected;
     bool fcConnected;
     bool fcArmed;
@@ -901,7 +1305,7 @@ static StateSnapshot s_lastSnapshot{};
 
 static bool hasStateChanged() {
     bool conn = false;
-    if (g_bridgeMode) {
+    if (g_bootMode != MODE_FLIGHT) {
         conn = false;
     } else if (g_activeBrand == BRAND_INSTA360) {
         conn = g_instaConnected;
@@ -914,7 +1318,7 @@ static bool hasStateChanged() {
     t = g_activeDriver->getTelemetry();
     portEXIT_CRITICAL(&g_telemetryMux);
 
-    bool bfConn = g_bfBridge.isTcpConnected();
+    bool bfConn = g_bfBleConnected || g_bfBridge.isBleConnected();
     bool fcConn = g_bfBridge.isFcConnected();
     bool fcArmed = g_bfBridge.isArmed();
     uint16_t auxVal = (g_auxRecChannel >= 1 && g_auxRecChannel <= 8) ? g_bfBridge.getAuxChannel(g_auxRecChannel) : 0;
@@ -923,14 +1327,14 @@ static bool hasStateChanged() {
 
     uint32_t now = millis();
     static uint32_t s_lastBytesPushMs = 0;
-    bool bytesChanged = ((s_lastSnapshot.bfTxBytes != bfTx || s_lastSnapshot.bfRxBytes != bfRx) && (now - s_lastBytesPushMs >= 1000));
+    bool bytesChanged = (g_bootMode == MODE_WIFI_SETUP) && ((s_lastSnapshot.bfTxBytes != bfTx || s_lastSnapshot.bfRxBytes != bfRx) && (now - s_lastBytesPushMs >= 1000));
     bool auxChanged = (abs((int)s_lastSnapshot.auxValue - (int)auxVal) > 25);
 
     if (s_lastSnapshot.version != g_telemetryVersion ||
         s_lastSnapshot.state != t.state ||
         s_lastSnapshot.isConnected != conn ||
         s_lastSnapshot.brand != g_activeBrand ||
-        s_lastSnapshot.bridgeMode != g_bridgeMode ||
+        s_lastSnapshot.bootMode != (uint8_t)g_bootMode ||
         s_lastSnapshot.bfConnected != bfConn ||
         s_lastSnapshot.fcConnected != fcConn ||
         s_lastSnapshot.fcArmed != fcArmed ||
@@ -941,7 +1345,7 @@ static bool hasStateChanged() {
         s_lastSnapshot.state = t.state;
         s_lastSnapshot.isConnected = conn;
         s_lastSnapshot.brand = g_activeBrand;
-        s_lastSnapshot.bridgeMode = g_bridgeMode;
+        s_lastSnapshot.bootMode = (uint8_t)g_bootMode;
         s_lastSnapshot.bfConnected = bfConn;
         s_lastSnapshot.fcConnected = fcConn;
         s_lastSnapshot.fcArmed = fcArmed;
@@ -1030,11 +1434,13 @@ static void processCommand(const CommandItem& item) {
             addLog("CMD", "Push Mode changed");
             break;
         case CMD_POWER_SLEEP:
+            g_explicitSleepRequested = true;
             g_activeDriver->powerSleep();
             g_telemetryVersion++;
             addLog("CMD", "Power Sleep command sent");
             break;
         case CMD_WAKE:
+            g_explicitSleepRequested = false;
             if (g_activeBrand == BRAND_DJI) {
                 startWkpWakeBroadcast();
             } else {
@@ -1115,7 +1521,7 @@ static void processCommand(const CommandItem& item) {
             }
             break;
         case CMD_SELECT_BRAND:
-            selectCameraBrand((CameraBrand)item.value, true);
+            selectCameraBrand((CameraBrand)item.value, false);
             break;
         case CMD_CLEAR_MAC:
             clearSavedMacActiveBrand();
@@ -1134,15 +1540,15 @@ static void processCommand(const CommandItem& item) {
                 ws.textAll("{\"type\":\"logs_cleared\"}");
             }
             break;
-        case CMD_ENTER_TCP_BRIDGE:
-            prefs.putBool("bf_mode", true);
-            addLog("SYSTEM", "Entering dedicated TCP Bridge mode (rebooting)...");
+        case CMD_START_FLIGHT_MODE:
+            prefs.putUChar("boot_mode", (uint8_t)MODE_FLIGHT);
+            addLog("SYSTEM", "Rebooting into BLE Flight Mode...");
             g_pendingRestart = true;
             g_restartTargetMs = millis() + 250;
             break;
-        case CMD_EXIT_TCP_BRIDGE:
-            prefs.putBool("bf_mode", false);
-            addLog("SYSTEM", "Exiting TCP Bridge mode (rebooting)...");
+        case CMD_ENTER_BF_BLE:
+            prefs.putUChar("boot_mode", (uint8_t)MODE_BF_BLE_BRIDGE);
+            addLog("SYSTEM", "Rebooting into dedicated Betaflight BLE Mode...");
             g_pendingRestart = true;
             g_restartTargetMs = millis() + 250;
             break;
@@ -1172,19 +1578,6 @@ static void processCommand(const CommandItem& item) {
                 addLog("CONFIG", buf);
             }
             g_telemetryVersion++;
-            break;
-        case CMD_SET_WIFI_OFF_ARM:
-            g_wifiOffOnArm = (item.value != 0);
-            prefs.putBool("wifi_arm", g_wifiOffOnArm);
-            addLog("CONFIG", g_wifiOffOnArm ? "Wi-Fi Off When Armed: ENABLED" : "Wi-Fi Off When Armed: DISABLED");
-            g_telemetryVersion++;
-            break;
-        case CMD_BF_BRIDGE_TOGGLE:
-            if (g_bridgeMode) {
-                enqueueCommand(CMD_EXIT_TCP_BRIDGE);
-            } else {
-                enqueueCommand(CMD_ENTER_TCP_BRIDGE);
-            }
             break;
     }
 }
@@ -1220,16 +1613,11 @@ static void handleCommandString(const char* cmd, const char* val) {
     else if (strcmp(cmd, "clear_mac") == 0) enqueueCommand(CMD_CLEAR_MAC);
     else if (strcmp(cmd, "save_default") == 0) enqueueCommand(CMD_SAVE_DEFAULT);
     else if (strcmp(cmd, "clear_logs") == 0) enqueueCommand(CMD_CLEAR_LOGS);
-    else if (strcmp(cmd, "enter_bridge") == 0) enqueueCommand(CMD_ENTER_TCP_BRIDGE);
-    else if (strcmp(cmd, "exit_bridge") == 0) enqueueCommand(CMD_EXIT_TCP_BRIDGE);
+    else if (strcmp(cmd, "start_flight") == 0) enqueueCommand(CMD_START_FLIGHT_MODE);
+    else if (strcmp(cmd, "enter_bf_ble") == 0) enqueueCommand(CMD_ENTER_BF_BLE);
     else if (strcmp(cmd, "set_auto_arm") == 0) enqueueCommand(CMD_SET_AUTO_ARM, val ? atoi(val) : 1);
     else if (strcmp(cmd, "set_disarm_delay") == 0) enqueueCommand(CMD_SET_DISARM_DELAY, val ? atoi(val) : 3);
     else if (strcmp(cmd, "set_aux_ch") == 0) enqueueCommand(CMD_SET_AUX_CHANNEL, val ? atoi(val) : 0);
-    else if (strcmp(cmd, "set_wifi_off_arm") == 0) enqueueCommand(CMD_SET_WIFI_OFF_ARM, val ? atoi(val) : 0);
-    else if (strcmp(cmd, "bf_bridge_toggle") == 0) {
-        if (g_bridgeMode) enqueueCommand(CMD_EXIT_TCP_BRIDGE);
-        else enqueueCommand(CMD_ENTER_TCP_BRIDGE);
-    }
     else if (strcmp(cmd, "select_cam") == 0 || strcmp(cmd, "select_brand") == 0) {
         if (val) enqueueCommand(CMD_SELECT_BRAND, atoi(val));
     }
@@ -1407,13 +1795,15 @@ static void setupWebServer() {
         request->send(200, "text/plain", "CLEARED");
     });
 
-    // API: Betaflight TCP Bridge Toggle
-    server.on("/api/bf_toggle", HTTP_POST, [](AsyncWebServerRequest* request) {
-        if (g_bridgeMode) {
-            enqueueCommand(CMD_EXIT_TCP_BRIDGE);
-        } else {
-            enqueueCommand(CMD_ENTER_TCP_BRIDGE);
-        }
+    // API: Start Flight Mode (Reboot into BLE Flight Mode)
+    server.on("/api/start_flight", HTTP_POST, [](AsyncWebServerRequest* request) {
+        enqueueCommand(CMD_START_FLIGHT_MODE);
+        request->send(200, "text/plain", "OK");
+    });
+
+    // API: Enter Betaflight BLE Bridge Mode
+    server.on("/api/enter_bf_ble", HTTP_POST, [](AsyncWebServerRequest* request) {
+        enqueueCommand(CMD_ENTER_BF_BLE);
         request->send(200, "text/plain", "OK");
     });
 
@@ -1436,11 +1826,83 @@ static void setupWebServer() {
 }
 
 // ============================================================================
+// Status LED Helper (Non-blocking mode indicator)
+// ============================================================================
+static void updateStatusLed(uint32_t now) {
+    bool ledOn = false;
+
+    if (g_bootMode == MODE_WIFI_SETUP) {
+        // Mode 1: Wi-Fi Setup Mode: Fast blink (150ms toggle)
+        ledOn = ((now / 150) % 2) == 0;
+    } else if (g_bootMode == MODE_BF_BLE_BRIDGE) {
+        // Mode 2: Dedicated Betaflight BLE Bridge: solid ON when connected; medium blink (400ms toggle) while advertising
+        if (g_bfBleConnected) {
+            ledOn = true;
+        } else {
+            ledOn = ((now / 400) % 2) == 0;
+        }
+    } else {
+        // Mode 0: BLE Flight Mode: Camera state indicator; solid ON if Betaflight BLE connected
+        if (g_bfBleConnected) {
+            ledOn = true;
+        } else {
+            bool camConnected = (g_activeBrand == BRAND_INSTA360) ? g_instaConnected : (pClient && pClient->isConnected());
+
+            CameraTelemetry t{};
+            if (g_activeDriver) {
+                portENTER_CRITICAL(&g_telemetryMux);
+                t = g_activeDriver->getTelemetry();
+                portEXIT_CRITICAL(&g_telemetryMux);
+            }
+
+            bool isRecording = camConnected && ((g_activeBrand == BRAND_INSTA360) ? (s_armRecStarted || s_auxRecStarted) : (t.isRecording || t.state == CAM_RECORDING));
+            bool isPaired = camConnected && ((g_activeBrand == BRAND_INSTA360) || (t.state == CAM_PAIRED));
+
+            if (isBroadcastingWake) {
+                // Fast strobe: 80ms ON, 80ms OFF (160ms cycle)
+                ledOn = (now % 160) < 80;
+            } else if (isRecording) {
+                // Recording: double-blink on 1200ms cycle
+                uint32_t phase = now % 1200;
+                ledOn = (phase < 100) || (phase >= 220 && phase < 320);
+            } else if (isPaired) {
+                // Paired & idle: solid ON
+                ledOn = true;
+            } else {
+                // Active search / disconnected / scanning: crisp double-pulse every 1500ms
+                uint32_t phase = now % 1500;
+                ledOn = (phase < 80) || (phase >= 200 && phase < 280);
+            }
+        }
+    }
+
+    // Write the pin cleanly (avoid redundant writes if state hasn't changed)
+    static int8_t s_lastLedState = -1;
+    int8_t pinLevel = STATUS_LED_ACTIVE_LOW ? (ledOn ? LOW : HIGH) : (ledOn ? HIGH : LOW);
+    if (pinLevel != s_lastLedState) {
+        s_lastLedState = pinLevel;
+        digitalWrite(STATUS_LED_PIN, pinLevel);
+    }
+}
+
+// ============================================================================
 // Setup
 // ============================================================================
 void setup() {
     Serial.begin(115200);
-    delay(500);
+    delay(50);
+
+    // Initialize Status LED & perform startup visual self-test (two quick 40ms flashes)
+    pinMode(STATUS_LED_PIN, OUTPUT);
+    for (int i = 0; i < 2; i++) {
+        digitalWrite(STATUS_LED_PIN, STATUS_LED_ACTIVE_LOW ? LOW : HIGH); // ON
+        delay(40);
+        digitalWrite(STATUS_LED_PIN, STATUS_LED_ACTIVE_LOW ? HIGH : LOW); // OFF
+        delay(40);
+    }
+
+    // Initialize BOOT button (GPIO 9) with internal pullup
+    pinMode(9, INPUT_PULLUP);
 
     addLog("BOOT", "OpenLogic Multi-Camera Controller Starting...");
 
@@ -1449,17 +1911,18 @@ void setup() {
 
     // Initialize NVS
     prefs.begin("camSwitch", false);
-    g_bridgeMode = prefs.getBool("bf_mode", false);
-    if (g_bridgeMode) {
-        prefs.putBool("bf_mode", false); // One-shot: clear immediately so normal power-cycle returns to camera mode
+    g_bootMode = (BootMode)prefs.getUChar("boot_mode", (uint8_t)MODE_FLIGHT);
+    if (g_bootMode != MODE_FLIGHT) {
+        prefs.putUChar("boot_mode", (uint8_t)MODE_FLIGHT); // One-shot: clear immediately so normal power-cycle returns to Flight Mode
     }
+    g_bootMs = millis();
+    g_autoWifiCancelled = false;
 
     g_autoRecOnArm = prefs.getBool("auto_arm", true);
     g_disarmDelaySec = prefs.getUChar("disarm_dly", 3);
     if (g_disarmDelaySec > 15) g_disarmDelaySec = 3;
     g_auxRecChannel = prefs.getUChar("aux_ch", 0);
     if (g_auxRecChannel > 8) g_auxRecChannel = 0;
-    g_wifiOffOnArm = prefs.getBool("wifi_arm", false);
 
     g_activeBrand = (CameraBrand)prefs.getUChar("brand", (uint8_t)BRAND_GOPRO);
     if (g_activeBrand >= BRAND_COUNT) g_activeBrand = BRAND_GOPRO;
@@ -1475,43 +1938,88 @@ void setup() {
     snprintf(bootMsg, sizeof(bootMsg), "Boot Default Camera: %s", g_activeDriver->getBrandName());
     addLog("BOOT", bootMsg);
 
-    // Initialize SoftAP & Captive Portal DNS
-    WiFi.persistent(false);
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_AP);
-
-    IPAddress apIP(192, 168, 4, 1);
-    IPAddress gateway(192, 168, 4, 1);
-    IPAddress subnet(255, 255, 255, 0);
-    WiFi.softAPConfig(apIP, gateway, subnet);
-
-    WiFi.softAP(AP_SSID, AP_PASS, 6);
-    delay(50);
-    WiFi.setSleep(false);
-    WiFi.setTxPower(WIFI_POWER_13dBm);
-
-    addLog("WIFI", ("SoftAP SSID: " + String(AP_SSID) + " (WPA2) IP: " + WiFi.softAPIP().toString()).c_str());
-
-    esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
-
-    dnsServer.start(DNS_PORT, "*", apIP);
-    addLog("DNS", "Wildcard Captive Portal DNS Server active on port 53");
-
-    // Initialize Web Server & WebSocket
-    setupWebServer();
-
     g_bfBridge.setLogCallback(addLog);
-    g_bfBridge.begin(g_bridgeMode);
 
-    if (g_bridgeMode) {
-        addLog("BOOT", "=== DEDICATED WI-FI TCP BRIDGE MODE ACTIVE ===");
-        addLog("BOOT", "Connect Betaflight Configurator to tcp://192.168.4.1:5761");
+    if (g_bootMode == MODE_WIFI_SETUP) {
+        // ====================================================================
+        // MODE 1: WI-FI SETUP (SoftAP & Web UI ONLY)
+        // ====================================================================
+        addLog("BOOT", "=== WI-FI SETUP MODE ACTIVE ===");
         addLog("BOOT", "BLE stack disabled for zero RF interference");
+
+        String hist = prefs.getString("diag_hist", "");
+        if (hist.length() > 0) {
+            int startIdx = 0;
+            while (startIdx < (int)hist.length()) {
+                int nextIdx = hist.indexOf('\n', startIdx);
+                if (nextIdx < 0) nextIdx = hist.length();
+                String line = hist.substring(startIdx, nextIdx);
+                line.trim();
+                if (line.length() > 0) {
+                    addLog("DIAG", line.c_str());
+                }
+                startIdx = nextIdx + 1;
+            }
+            prefs.remove("diag_hist");
+        }
+        prefs.remove("last_disc_r");
+        prefs.remove("last_disc_src");
+        prefs.remove("last_disc_ms");
+        prefs.remove("last_disc_st");
+        prefs.remove("last_disc_pkt");
+        prefs.remove("last_disc_pm");
+        prefs.remove("last_disc_cs");
+        prefs.remove("last_disc_age");
+
+        g_bfBridge.begin(true); // Passthrough / pause internal MSP polling
+
+        WiFi.persistent(false);
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_AP);
+
+        IPAddress apIP(192, 168, 4, 1);
+        IPAddress gateway(192, 168, 4, 1);
+        IPAddress subnet(255, 255, 255, 0);
+        WiFi.softAPConfig(apIP, gateway, subnet);
+        WiFi.softAP(AP_SSID, AP_PASS, 1);
+        delay(50);
+        WiFi.setSleep(false);
+        WiFi.setTxPower(WIFI_POWER_8_5dBm);
+
+        addLog("WIFI", ("SoftAP SSID: " + String(AP_SSID) + " (WPA2) IP: " + WiFi.softAPIP().toString()).c_str());
+
+        dnsServer.start(DNS_PORT, "*", apIP);
+        addLog("DNS", "Wildcard Captive Portal DNS Server active on port 53");
+
+        setupWebServer();
+    } else if (g_bootMode == MODE_BF_BLE_BRIDGE) {
+        // ====================================================================
+        // MODE 2: DEDICATED BETAFLIGHT BLE BRIDGE MODE
+        // ====================================================================
+        addLog("BOOT", "=== DEDICATED BETAFLIGHT BLE BRIDGE MODE ACTIVE ===");
+        addLog("BOOT", "Connect Betaflight Configurator (app.betaflight.com) via Web Bluetooth to 'OpenLogic_BF'");
+        addLog("BOOT", "Wi-Fi radio turned off; Camera BLE paused");
+
+        g_bfBridge.begin(true); // Passthrough / pause internal MSP polling
+
+        NimBLEDevice::init("OpenLogic_BF");
+        NimBLEDevice::setPower(9);
+        NimBLEDevice::setMTU(247);
+
+        setupBetaflightBleServer(true);
     } else {
-        // Initialize NimBLE Stack strictly for active brand role
+        // ====================================================================
+        // MODE 0: BLE FLIGHT MODE (DEFAULT ON BOOT)
+        // ====================================================================
+        addLog("BOOT", "=== BLE FLIGHT MODE ACTIVE ===");
+        addLog("BOOT", "Wi-Fi radio turned off for zero RF contention");
+
+        g_bfBridge.begin(false); // Normal MSP arm & AUX monitoring
+
+        // Initialize NimBLE strictly for active brand role
         if (g_activeBrand == BRAND_INSTA360) {
-            // BLE Peripheral named "Insta360 GPS Remote"
             NimBLEDevice::init("Insta360 GPS Remote");
+            NimBLEDevice::setPower(9);
             NimBLEDevice::setMTU(247);
 
             pServer = NimBLEDevice::createServer();
@@ -1542,12 +2050,14 @@ void setup() {
             pAdv->start();
             addLog("BLE", "Insta360 GPS Remote Peripheral active & advertising 0xCE80");
         } else {
-            // Pure Central Mode for DJI & GoPro (No BLE Server / No NUS / No SpeedyBee BLE!)
             NimBLEDevice::init(BLE_DEVICE_NAME);
+            NimBLEDevice::setPower(9);
             NimBLEDevice::setMTU(247);
 
+            setupBetaflightBleServer(false);
+
             pClient = NimBLEDevice::createClient();
-            pClient->setClientCallbacks(new ClientCallbacks(), false);
+            pClient->setClientCallbacks(&s_clientCallbacks, false);
 
             NimBLEScan* pScan = NimBLEDevice::getScan();
             pScan->setScanCallbacks(new ScanCallbacks(), false);
@@ -1566,7 +2076,7 @@ static void runArmAndAuxController(uint32_t now) {
 
     static bool s_lastArmed = false;
     static bool s_auxHigh = false;
-    static uint32_t s_lastMspSampleMs = 0;
+    static uint32_t s_lastStatusSampleMs = 0;
     static uint8_t s_armCandidateCount = 0;
     static bool s_lastCandidateArmed = false;
 
@@ -1577,11 +2087,19 @@ static void runArmAndAuxController(uint32_t now) {
         camConnected = (pClient && pClient->isConnected());
     }
 
-    // 1. Arm Trigger (sampled on each MSP packet, debounced over 2 consecutive reads)
+    CameraTelemetry t{};
+    if (g_activeDriver) {
+        portENTER_CRITICAL(&g_telemetryMux);
+        t = g_activeDriver->getTelemetry();
+        portEXIT_CRITICAL(&g_telemetryMux);
+    }
+    bool camReady = camConnected && (t.state == CAM_PAIRED || t.state == CAM_RECORDING);
+
+    // 1. Arm Trigger (sampled on each MSP_STATUS packet, debounced over 2 consecutive reads)
     if (fcConnected) {
-        uint32_t mspRespMs = g_bfBridge.getLastMspResponseMs();
-        if (mspRespMs != s_lastMspSampleMs) {
-            s_lastMspSampleMs = mspRespMs;
+        uint32_t statusMs = g_bfBridge.getLastStatusMs();
+        if (statusMs != s_lastStatusSampleMs) {
+            s_lastStatusSampleMs = statusMs;
 
             if (isArmed == s_lastCandidateArmed) {
                 if (s_armCandidateCount < 255) s_armCandidateCount++;
@@ -1596,18 +2114,29 @@ static void runArmAndAuxController(uint32_t now) {
                 if (s_lastArmed) {
                     // Disarmed -> Armed edge
                     s_disarmTargetMs = 0; // Cancel pending stop immediately
-                    if (g_autoRecOnArm && camConnected) {
-                        bool isRec = g_activeDriver ? g_activeDriver->getTelemetry().isRecording : false;
-                        if ((g_activeBrand == BRAND_INSTA360 && !s_autoRecStarted) ||
-                            ((g_activeBrand == BRAND_DJI || g_activeBrand == BRAND_GOPRO) && !isRec)) {
-                            enqueueCommand(CMD_RECORD_START);
-                            s_autoRecStarted = true;
-                            addLog("ARM", "FC Armed -> Start Recording");
+                    if (g_autoRecOnArm) {
+                        if (camReady) {
+                            if ((g_activeBrand == BRAND_INSTA360 && !s_armRecStarted) ||
+                                (g_activeBrand != BRAND_INSTA360 && !t.isRecording)) {
+                                enqueueCommand(CMD_RECORD_START);
+                                s_armRecStarted = true;
+                                addLog("ARM", "FC Armed -> Start Recording");
+                            }
+                        } else if (g_activeBrand == BRAND_DJI && hasTargetAddress) {
+                            g_pendingRecordOnWake = true;
+                            g_pendingRecordExpireMs = now + 15000;
+                            s_armRecStarted = true;
+                            enqueueCommand(CMD_WAKE);
+                            addLog("ARM", "Camera asleep -> WKP wake + auto-record");
                         }
                     }
                 } else {
                     // Armed -> Disarmed edge
-                    if (g_autoRecOnArm && s_autoRecStarted) {
+                    if (g_pendingRecordOnWake) {
+                        g_pendingRecordOnWake = false;
+                        s_armRecStarted = false;
+                        s_disarmTargetMs = 0;
+                    } else if (g_autoRecOnArm && s_armRecStarted) {
                         s_disarmTargetMs = millis() + ((uint32_t)g_disarmDelaySec * 1000);
                         char buf[64];
                         snprintf(buf, sizeof(buf), "FC Disarmed -> Stop in %u s", (unsigned)g_disarmDelaySec);
@@ -1622,11 +2151,11 @@ static void runArmAndAuxController(uint32_t now) {
     // 2. Pending Disarm Delay Timeout
     if (s_disarmTargetMs > 0 && (int32_t)(now - s_disarmTargetMs) >= 0) {
         s_disarmTargetMs = 0;
-        s_autoRecStarted = false;
-        if (camConnected) {
+        if (camReady && ((g_activeBrand == BRAND_INSTA360 && s_armRecStarted) || (g_activeBrand != BRAND_INSTA360 && t.isRecording))) {
             enqueueCommand(CMD_RECORD_STOP);
             addLog("ARM", "Disarm delay expired -> Stop Recording");
         }
+        s_armRecStarted = false;
     }
 
     // 3. AUX Channel Trigger (works even when disarmed for bench testing)
@@ -1635,60 +2164,51 @@ static void runArmAndAuxController(uint32_t now) {
         if (val >= 800) { // Ignore uninitialized channels (< 800)
             if (val >= 1700 && !s_auxHigh) {
                 s_auxHigh = true;
-                if (camConnected) {
-                    bool isRec = g_activeDriver ? g_activeDriver->getTelemetry().isRecording : false;
-                    if (!isRec) {
+                if (camReady) {
+                    if ((g_activeBrand == BRAND_INSTA360 && !s_auxRecStarted) ||
+                        (g_activeBrand != BRAND_INSTA360 && !t.isRecording)) {
                         enqueueCommand(CMD_RECORD_START);
-                        s_autoRecStarted = true;
+                        s_auxRecStarted = true;
                         addLog("AUX", "AUX switch HIGH -> Start Recording");
                     }
+                } else if (g_activeBrand == BRAND_DJI && hasTargetAddress) {
+                    g_pendingRecordOnWake = true;
+                    g_pendingRecordExpireMs = now + 15000;
+                    s_auxRecStarted = true;
+                    enqueueCommand(CMD_WAKE);
+                    addLog("AUX", "Camera asleep -> WKP wake + auto-record");
                 }
             } else if (val <= 1300 && s_auxHigh) {
                 s_auxHigh = false;
-                if (camConnected) {
-                    bool isRec = g_activeDriver ? g_activeDriver->getTelemetry().isRecording : false;
-                    if (isRec || s_autoRecStarted) {
-                        enqueueCommand(CMD_RECORD_STOP);
-                        s_autoRecStarted = false;
-                        addLog("AUX", "AUX switch LOW -> Stop Recording");
+                if (g_pendingRecordOnWake) {
+                    g_pendingRecordOnWake = false;
+                    s_auxRecStarted = false;
+                } else {
+                    if (camReady) {
+                        if ((g_activeBrand == BRAND_INSTA360 && s_auxRecStarted) ||
+                            (g_activeBrand != BRAND_INSTA360 && t.isRecording)) {
+                            enqueueCommand(CMD_RECORD_STOP);
+                            addLog("AUX", "AUX switch LOW -> Stop Recording");
+                        }
                     }
+                    s_auxRecStarted = false;
                 }
             }
         }
     }
-}
 
-// ============================================================================
-// Wi-Fi Power Management (Wi-Fi Off When Armed)
-// ============================================================================
-static void runWifiPowerManagement(uint32_t now) {
-    bool isArmed = g_bfBridge.isFcConnected() && g_bfBridge.isArmed();
-
-    if (isArmed && !g_wifiSuspended) {
-        g_wifiSuspended = true;
-        g_wifiRestoreAtMs = 0;
-        ws.closeAll();
-        dnsServer.stop();
-        WiFi.softAPdisconnect(true);
-        WiFi.mode(WIFI_OFF);
-        addLog("WIFI", "SoftAP disabled while armed");
-    } else if (!isArmed && g_wifiSuspended) {
-        if (g_wifiRestoreAtMs == 0) {
-            g_wifiRestoreAtMs = now + 2000;
-        } else if ((int32_t)(now - g_wifiRestoreAtMs) >= 0) {
-            g_wifiRestoreAtMs = 0;
-            WiFi.mode(WIFI_AP);
-            IPAddress apIP(192, 168, 4, 1);
-            IPAddress gateway(192, 168, 4, 1);
-            IPAddress subnet(255, 255, 255, 0);
-            WiFi.softAPConfig(apIP, gateway, subnet);
-            WiFi.softAP(AP_SSID, AP_PASS, 6);
-            delay(50);
-            WiFi.setSleep(false);
-            WiFi.setTxPower(WIFI_POWER_13dBm);
-            dnsServer.start(DNS_PORT, "*", apIP);
-            g_wifiSuspended = false;
-            addLog("WIFI", "SoftAP restored after landing");
+    // 4. Pending Wake-Record Trigger
+    if (g_pendingRecordOnWake) {
+        if ((int32_t)(now - g_pendingRecordExpireMs) >= 0) {
+            g_pendingRecordOnWake = false;
+            s_armRecStarted = false;
+            s_auxRecStarted = false;
+        } else if (camReady) {
+            g_pendingRecordOnWake = false;
+            if (!t.isRecording) {
+                enqueueCommand(CMD_RECORD_START);
+                addLog("WAKE", "Camera awake & paired -> Starting recording");
+            }
         }
     }
 }
@@ -1699,24 +2219,210 @@ static void runWifiPowerManagement(uint32_t now) {
 void loop() {
     uint32_t now = millis();
 
-    // 1. Process Captive Portal DNS Requests
-    if (!g_wifiSuspended) {
-        for (int i = 0; i < 4; i++) {
-            dnsServer.processNextRequest();
-        }
-    }
+    // 1. Update Status LED
+    updateStatusLed(now);
 
-    // 2. Scheduled Reboot for Clean BLE Role Switching
+    // 2. Scheduled Reboot Handler
     if (g_pendingRestart && (int32_t)(now - g_restartTargetMs) >= 0) {
         ESP.restart();
     }
 
-    // 3. Deferred BLE Connect Processing for Insta360 on loopTask
-    if (!g_bridgeMode && g_instaConnectPending) {
+    if (g_bootMode == MODE_WIFI_SETUP) {
+        // ====================================================================
+        // MODE 1: WI-FI SETUP LOOP
+        // ====================================================================
+        // Process Captive Portal DNS Requests
+        for (int i = 0; i < 4; i++) {
+            dnsServer.processNextRequest();
+        }
+
+        // WebSocket Client Cleanup
+        static uint32_t lastWsCleanupMs = 0;
+        if (now - lastWsCleanupMs >= 500) {
+            lastWsCleanupMs = now;
+            ws.cleanupClients();
+        }
+
+        // Drain and process Command Queue on loopTask
+        if (g_cmdQueue) {
+            CommandItem cmd;
+            while (xQueueReceive(g_cmdQueue, &cmd, 0) == pdTRUE) {
+                processCommand(cmd);
+            }
+        }
+
+        // Flush pending logs to WebSocket clients
+        flushLogsToWebSocket();
+
+        // Rate-limited WebSocket Telemetry Broadcast (Max 5 Hz = every >= 200ms)
+        static uint32_t lastWsStatePushMs = 0;
+        if (now - lastWsStatePushMs >= 200) {
+            if (hasStateChanged()) {
+                broadcastStateJson();
+                lastWsStatePushMs = now;
+            }
+        }
+
+        g_bfBridge.loop();
+        delay(2);
+        return;
+    }
+
+    // ========================================================================
+    // COMMON FOR BLE FLIGHT MODE & DEDICATED BLE BRIDGE MODE:
+    // BOOT Button (GPIO 9) 2-Second Hold -> Switch to Wi-Fi Setup Mode
+    // ========================================================================
+    static uint32_t s_bootBtnLowStartMs = 0;
+    if (digitalRead(9) == LOW) {
+        if (s_bootBtnLowStartMs == 0) {
+            s_bootBtnLowStartMs = now;
+        } else if (now - s_bootBtnLowStartMs >= 2000) {
+            s_bootBtnLowStartMs = 0;
+            addLog("MODE", "BOOT button held 2s -> Switching to Wi-Fi Setup Mode");
+            flushDiagHistoryToNvs();
+            prefs.putUChar("boot_mode", (uint8_t)MODE_WIFI_SETUP);
+            prefs.end();
+            delay(50);
+            ESP.restart();
+        }
+    } else {
+        s_bootBtnLowStartMs = 0;
+    }
+
+    if (g_bootMode == MODE_BF_BLE_BRIDGE) {
+        // ====================================================================
+        // MODE 2: DEDICATED BETAFLIGHT BLE BRIDGE LOOP
+        // ====================================================================
+        if (g_cmdQueue) {
+            CommandItem cmd;
+            while (xQueueReceive(g_cmdQueue, &cmd, 0) == pdTRUE) {
+                processCommand(cmd);
+            }
+        }
+
+        g_bfBridge.loop();
+
+        if (g_bfBleConnected) {
+            if (!s_bfParamsUpdated && s_bfBleConnAtMs > 0 && (now - s_bfBleConnAtMs >= 600)) {
+                s_bfParamsUpdated = true;
+                if (pServer) {
+                    pServer->updateConnParams(g_bfBleConnHandle, 6, 12, 0, 400);
+                }
+            }
+            vTaskDelay(1);
+        } else {
+            delay(2);
+        }
+        return;
+    }
+
+    // ========================================================================
+    // MODE 0: BLE FLIGHT MODE LOOP
+    // ========================================================================
+
+    // 1. ELRS-Style 60-Second Auto-Wi-Fi Timeout
+    bool camConnected = (g_activeBrand == BRAND_INSTA360) ? g_instaConnected : (pClient && pClient->isConnected());
+    if (!g_autoWifiCancelled && (camConnected || g_bfBridge.isArmed() || g_bfBleConnected)) {
+        g_autoWifiCancelled = true;
+        addLog("MODE", "Auto-Wi-Fi timeout cancelled (camera active, FC armed, or BF BLE connected)");
+    }
+    if (!g_autoWifiCancelled && (now - g_bootMs >= 60000UL)) {
+        addLog("MODE", "No activity in 60s -> Switching to Wi-Fi Setup Mode");
+        flushDiagHistoryToNvs();
+        prefs.putUChar("boot_mode", (uint8_t)MODE_WIFI_SETUP);
+        prefs.end();
+        delay(50);
+        ESP.restart();
+    }
+
+    // 2. Control NUS Advertising in Flight Mode for DJI/GoPro
+    if (g_activeBrand != BRAND_INSTA360) {
+        CameraTelemetry t{};
+        if (g_activeDriver) {
+            portENTER_CRITICAL(&g_telemetryMux);
+            t = g_activeDriver->getTelemetry();
+            portEXIT_CRITICAL(&g_telemetryMux);
+        }
+        bool camPaired = camConnected && (t.state == CAM_PAIRED || t.state == CAM_RECORDING);
+        if (camPaired) {
+            if (g_camPairedAtMs == 0) g_camPairedAtMs = now;
+        } else {
+            g_camPairedAtMs = 0;
+        }
+
+        bool idleStableForAdv = !camConnected && (g_lastDisconnectMs == 0 || (now - g_lastDisconnectMs >= 1000UL));
+        bool shouldAdvNus = s_nusServerStarted && idleStableForAdv && !g_bfBridge.isArmed() && !g_bfBleConnected &&
+                            !isBroadcastingWake && !g_pendingRecordOnWake && (connStep == CONN_IDLE) &&
+                            (now - g_bootMs >= 4000UL);
+
+        static uint32_t s_lastAdvTryMs = 0;
+        static bool s_lastLoggedAdvState = false;
+        NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+        if (pAdv) {
+            if (shouldAdvNus && !pAdv->isAdvertising() && (now - s_lastAdvTryMs >= 1000UL)) {
+                s_lastAdvTryMs = now;
+                NimBLEScan* pScan = NimBLEDevice::getScan();
+                bool wasScanning = pScan && pScan->isScanning();
+                if (wasScanning) {
+                    pScan->stop();
+                    delay(20);
+                }
+                configureNusAdvertising();
+                bool ok = pAdv->start();
+                char diagEvt[32];
+                snprintf(diagEvt, sizeof(diagEvt), "A@%lu ok=%d", (unsigned long)now, ok ? 1 : 0);
+                appendDiagEvent(diagEvt, false);
+                if (!s_lastLoggedAdvState) {
+                    s_lastLoggedAdvState = true;
+                    if (Serial && Serial.availableForWrite() >= 96) {
+                        Serial.printf("[%lu][ADV] pAdv->start() -> ok=%d (isAdv=%d)\r\n",
+                                      (unsigned long)now, ok ? 1 : 0, pAdv->isAdvertising() ? 1 : 0);
+                    }
+                }
+                if (wasScanning) {
+                    pScan->setInterval(160);
+                    pScan->setWindow(32);
+                    pScan->start(2000, false);
+                }
+            } else if (!shouldAdvNus && pAdv->isAdvertising()) {
+                pAdv->stop();
+                if (s_lastLoggedAdvState) {
+                    s_lastLoggedAdvState = false;
+                    if (Serial && Serial.availableForWrite() >= 96) {
+                        Serial.printf("[%lu][ADV] pAdv->stop() -> reason: shouldAdvNus=0 (camConn=%d step=%d armed=%d bfBle=%d)\r\n",
+                                      (unsigned long)now, camConnected ? 1 : 0, (int)connStep, g_bfBridge.isArmed() ? 1 : 0, g_bfBleConnected ? 1 : 0);
+                    }
+                }
+            }
+        }
+
+        static uint32_t s_lastStatPrintMs = 0;
+        if (now - s_lastStatPrintMs >= 3000UL) {
+            s_lastStatPrintMs = now;
+            NimBLEScan* pScan = NimBLEDevice::getScan();
+            int32_t bo = (int32_t)(s_cameraConnBackoffUntilMs - now);
+            if (Serial && Serial.availableForWrite() >= 96) {
+                Serial.printf("[%lu][STAT] camConn=%d step=%d scan=%d adv=%d shouldAdv=%d armed=%d bfBle=%d backoff=%ldms\r\n",
+                              (unsigned long)now,
+                              camConnected ? 1 : 0,
+                              (int)connStep,
+                              (pScan && pScan->isScanning()) ? 1 : 0,
+                              (pAdv && pAdv->isAdvertising()) ? 1 : 0,
+                              shouldAdvNus ? 1 : 0,
+                              g_bfBridge.isArmed() ? 1 : 0,
+                              g_bfBleConnected ? 1 : 0,
+                              (long)(bo > 0 ? bo : 0));
+            }
+        }
+    }
+
+    // 3. Deferred BLE Connect Processing for Insta360
+    if (g_instaConnectPending) {
         g_instaConnectPending = false;
         if (g_instaConnected) {
             g_instaConnHandle = g_stagedInstaConnHandle;
-            saveActiveBrandMac(g_stagedInstaAddr);
+            s_pendingInstaAddr = g_stagedInstaAddr;
+            s_instaMacSaveAtMs = now + 500;
             g_activeDriver->onConnected(g_instaConnHandle, bleWriteCallback);
             portENTER_CRITICAL(&g_telemetryMux);
             g_telemetryVersion++;
@@ -1724,10 +2430,24 @@ void loop() {
         }
     }
 
-    // 4. Deferred BLE Disconnect Processing on loopTask
-    if (!g_bridgeMode && g_disconnectPending) {
+    // 4. Deferred BLE Disconnect Processing
+    if (g_disconnectPending) {
         g_disconnectPending = false;
-        addLog("BLE", "Link disconnected; cleaning up on loopTask");
+        s_hadDisconnectThisBoot = true;
+        s_macSavedThisSession = false;
+        s_diagPairedLoggedThisSession = false;
+        g_camPairedAtMs = 0;
+        g_lastDisconnectMs = millis();
+        s_cameraConnBackoffUntilMs = now + 200UL;
+        s_instaMacSaveAtMs = 0;
+        g_explicitSleepRequested = false;
+
+        g_cameraAsleep = false;
+
+        recordFirstDisconnect("BLE_EVENT", g_lastDisconnectReason, now);
+        char discMsg[64];
+        snprintf(discMsg, sizeof(discMsg), "Link disconnected (reason=0x%02X); active search resumed", (unsigned)g_lastDisconnectReason);
+        addLog("BLE", discMsg);
         connStep = CONN_IDLE;
         pWriteChar = nullptr;
         pNotifyChar = nullptr;
@@ -1735,24 +2455,24 @@ void loop() {
         pGoproSettingsNotifyChar = nullptr;
         pGoproQueryWriteChar = nullptr;
         pGoproQueryNotifyChar = nullptr;
+        s_armRecStarted = false;
+        s_auxRecStarted = false;
         g_activeDriver->onDisconnected();
         g_telemetryVersion++;
 
         if (g_activeBrand != BRAND_INSTA360) {
-            startBleScan();
+            if (pClient) {
+                NimBLEDevice::deleteClient(pClient);
+                pClient = nullptr;
+            }
+            g_bleScanAllowedAfterMs = now + 100;
+            lastScanRestartMs = now;
         } else {
             NimBLEDevice::getAdvertising()->start();
         }
     }
 
-    // 5. Periodic WebSocket client cleanup
-    static uint32_t lastWsCleanupMs = 0;
-    if (!g_wifiSuspended && now - lastWsCleanupMs >= 500) {
-        lastWsCleanupMs = now;
-        ws.cleanupClients();
-    }
-
-    // 6. Drain and process Command Queue on loopTask
+    // 5. Drain and process Command Queue on loopTask
     if (g_cmdQueue) {
         CommandItem cmd;
         while (xQueueReceive(g_cmdQueue, &cmd, 0) == pdTRUE) {
@@ -1760,70 +2480,115 @@ void loop() {
         }
     }
 
-    // 7. Handle WKP Wake Broadcast Timeout (2.5s)
-    if (!g_bridgeMode && isBroadcastingWake) {
+    // 6. Handle WKP Wake Broadcast Timeout (2.5s)
+    if (isBroadcastingWake) {
         if (now - wakeBroadcastStartMs >= 2500) {
             stopWkpWakeBroadcast();
         }
         g_bfBridge.loop();
+        runArmAndAuxController(now);
         delay(5);
         return;
     }
 
-    // 8. Run Non-Blocking Connection State Machine (Central mode)
-    if (!g_bridgeMode && g_activeBrand != BRAND_INSTA360 && connStep != CONN_IDLE) {
+    // 7. Run Non-Blocking Connection State Machine (Central mode)
+    if (g_activeBrand != BRAND_INSTA360 && connStep != CONN_IDLE) {
         runConnectionStateMachine(now);
     }
 
-    // 9. Periodic Driver Updates (Telemetry watchdogs, heartbeats)
-    if (!g_bridgeMode && g_activeDriver) {
+    // 8. Periodic Driver Updates (Telemetry watchdogs, heartbeats)
+    if (g_activeDriver) {
         g_activeDriver->updateLoop(now);
 
-        // Check if driver requested link teardown
+        // Check if driver requested link teardown (camera sleep / shutdown)
         if (g_activeDriver->shouldDisconnect()) {
             if (pClient && pClient->isConnected()) {
-                addLog("BLE", "Camera inactive / sleeping -> Teardown stale link");
+                g_explicitSleepRequested = false;
+                g_cameraAsleep = false;
+                addLog("BLE", "Camera shutdown / sleep confirmed -> Closing link");
                 pClient->disconnect();
+                g_lastDisconnectReason = 0x213; // Remote User Terminated Connection
+                g_disconnectPending = true;
+            }
+        }
+
+        // Telemetry timeout watchdog: if paired but no telemetry received for > 1.8s
+        if (g_activeBrand == BRAND_DJI && pClient && pClient->isConnected()) {
+            CameraTelemetry curT{};
+            portENTER_CRITICAL(&g_telemetryMux);
+            curT = g_activeDriver->getTelemetry();
+            portEXIT_CRITICAL(&g_telemetryMux);
+            if (curT.state == CAM_PAIRED || curT.state == CAM_RECORDING) {
+                uint32_t lastTelem = g_activeDriver->getLastTelemetryMs();
+                if (lastTelem > 0 && (now - lastTelem >= 1800UL)) {
+                    addLog("BLE", "Telemetry timeout (1.8s without packets) -> Dropping dead link");
+                    pClient->disconnect();
+                    g_lastDisconnectReason = 0x208; // Connection Timeout
+                    g_disconnectPending = true;
+                }
             }
         }
     }
 
-    // 10. Flush pending logs to WebSocket clients
-    if (!g_wifiSuspended) {
-        flushLogsToWebSocket();
-    }
-
-    // 11. Rate-limited WebSocket Telemetry Broadcast (Max 5 Hz = every >= 200ms)
-    static uint32_t lastWsStatePushMs = 0;
-    if (!g_wifiSuspended && now - lastWsStatePushMs >= 200) {
-        if (hasStateChanged()) {
-            broadcastStateJson();
-            lastWsStatePushMs = now;
+    // Deferred MAC saving once camera is confirmed paired/authenticated
+    if (g_activeBrand != BRAND_INSTA360 && camConnected) {
+        CameraTelemetry t{};
+        if (g_activeDriver) {
+            portENTER_CRITICAL(&g_telemetryMux);
+            t = g_activeDriver->getTelemetry();
+            portEXIT_CRITICAL(&g_telemetryMux);
+        }
+        if (t.state == CAM_PAIRED || t.state == CAM_RECORDING) {
+            g_cameraAsleep = false;
+            if (!s_diagPairedLoggedThisSession) {
+                s_diagPairedLoggedThisSession = true;
+                char diagEvt[64];
+                snprintf(diagEvt, sizeof(diagEvt), "P@%lu", (unsigned long)now);
+                appendDiagEvent(diagEvt, false);
+            }
+            if (!s_macSavedThisSession) {
+                s_macSavedThisSession = true;
+                saveActiveBrandMac(targetAddress);
+            }
         }
     }
 
-    // 12. Time-sliced BLE scanning (Central mode only)
-    if (!g_bridgeMode && g_activeBrand != BRAND_INSTA360) {
+    // Deferred Insta360 MAC saving
+    if (g_instaConnected && s_instaMacSaveAtMs > 0 && (int32_t)(now - s_instaMacSaveAtMs) >= 0) {
+        s_instaMacSaveAtMs = 0;
+        saveActiveBrandMac(s_pendingInstaAddr);
+    }
+
+    // 9. Time-sliced BLE scanning (Central mode only, paused while Betaflight BLE is connected)
+    if (g_bfBleConnected) {
+        NimBLEScan* pScan = NimBLEDevice::getScan();
+        if (pScan && pScan->isScanning()) {
+            pScan->stop();
+        }
+    } else if (g_activeBrand != BRAND_INSTA360) {
         if ((!pClient || !pClient->isConnected()) && connStep == CONN_IDLE && !isBroadcastingWake) {
             NimBLEScan* pScan = NimBLEDevice::getScan();
-            if (!pScan->isScanning() && (now - lastScanRestartMs >= 4000)) {
+            if (!pScan->isScanning() && (now - lastScanRestartMs >= 100)) {
                 startBleScan();
             }
         }
     }
 
-    // 13. Run Betaflight Bridge (TCP bridge or UART MSP monitor)
+    // 10. Run Betaflight Bridge (UART MSP monitor & BLE forwarder)
     g_bfBridge.loop();
 
-    // 14. Edge-Triggered Recording Controller
-    if (!g_bridgeMode) {
-        runArmAndAuxController(now);
-    }
+    // 11. Edge-Triggered Recording Controller
+    runArmAndAuxController(now);
 
-    // 15. Wi-Fi Power Management (Wi-Fi Off When Armed)
-    if (!g_bridgeMode && g_wifiOffOnArm) {
-        runWifiPowerManagement(now);
+    if (g_bfBleConnected) {
+        if (!s_bfParamsUpdated && s_bfBleConnAtMs > 0 && (now - s_bfBleConnAtMs >= 600)) {
+            s_bfParamsUpdated = true;
+            if (pServer) {
+                pServer->updateConnParams(g_bfBleConnHandle, 6, 12, 0, 400);
+            }
+        }
+        vTaskDelay(1);
+    } else {
+        delay(2);
     }
-
-    delay(2);
 }

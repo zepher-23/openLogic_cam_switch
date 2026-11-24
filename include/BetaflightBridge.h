@@ -2,7 +2,7 @@
 #define BETAFLIGHT_BRIDGE_H
 
 #include <Arduino.h>
-#include <WiFi.h>
+#include <algorithm>
 
 #ifndef FC_SERIAL
 #define FC_SERIAL Serial1
@@ -17,17 +17,33 @@
 #endif
 
 typedef void (*BfLogCallback)(const char* tag, const char* msg);
+typedef bool (*BfBleTxCallback)(const uint8_t* data, size_t len);
 
 class BetaflightBridge {
 public:
     BetaflightBridge();
     ~BetaflightBridge();
 
-    void begin(bool isBridgeMode);
+    void begin(bool passthroughOnly = false);
     void loop();
 
-    bool isBridgeMode() const { return m_isBridgeMode; }
-    bool isTcpConnected() const { return m_isBridgeMode && m_tcpConnected; }
+    void setBleTxCallback(BfBleTxCallback cb) { m_bleTxCb = cb; }
+    void setBleConnected(bool connected) {
+        m_bleConnected = connected;
+        m_bleResetPending = true;
+        if (!connected) {
+            m_bleTxChunkMax = 20;
+        }
+    }
+    bool isBleConnected() const { return m_bleConnected; }
+    void setBleMtu(uint16_t mtu) {
+        m_bleTxChunkMax = std::min<size_t>(mtu > 3 ? mtu - 3 : 20, 244);
+    }
+    void pushBleRx(const uint8_t* data, size_t len);
+
+    bool isPassthroughOnly() const { return m_passthroughOnly; }
+    void setPassthroughOnly(bool p) { m_passthroughOnly = p; }
+
     bool isFcConnected() const { return m_fcConnected; }
     bool isArmed() const { return m_isArmed; }
     uint32_t getFlightModeFlags() const { return m_flightModeFlags; }
@@ -37,22 +53,39 @@ public:
     }
 
     uint16_t getAuxChannel(uint8_t auxNum) const {
-        // AUX1 = index 4, AUX2 = index 5, AUX3 = index 6, AUX4 = index 7
         return (auxNum >= 1 && auxNum <= 8) ? m_rcChannels[3 + auxNum] : 0;
     }
 
     uint32_t getRxBytes() const { return m_rxBytes; }
     uint32_t getTxBytes() const { return m_txBytes; }
     uint32_t getLastMspResponseMs() const { return m_lastMspResponseMs; }
+    uint32_t getLastStatusMs() const { return m_lastStatusMs; }
 
     void setLogCallback(BfLogCallback cb) { m_logCb = cb; }
 
 private:
-    bool m_isBridgeMode;
-    bool m_tcpConnected;
-    WiFiServer m_tcpServer;
-    WiFiClient m_tcpClient;
+    bool m_passthroughOnly;
+    bool m_bleConnected;
+    BfBleTxCallback m_bleTxCb;
     BfLogCallback m_logCb;
+
+    // Spinlock-protected 512-byte ring buffer for incoming BLE NUS data
+    static constexpr size_t BLE_RX_RING_SIZE = 512;
+    uint8_t m_bleRxRing[BLE_RX_RING_SIZE];
+    size_t m_bleRxHead;
+    size_t m_bleRxTail;
+    portMUX_TYPE m_bleRxMux;
+
+    // 512-byte ring buffer for outgoing BLE NUS data
+    static constexpr size_t BLE_TX_RING_SIZE = 512;
+    uint8_t m_bleTxRing[BLE_TX_RING_SIZE];
+    size_t m_bleTxHead;
+    size_t m_bleTxTail;
+    uint32_t m_lastUartRxMs;
+    uint32_t m_lastUartRxUs;
+    uint32_t m_lastBleTxRetryMs;
+    size_t m_bleTxChunkMax;
+    volatile bool m_bleResetPending;
 
     uint32_t m_rxBytes;
     uint32_t m_txBytes;
@@ -65,6 +98,7 @@ private:
     uint16_t m_rcChannels[12];
     uint32_t m_lastMspPollMs;
     uint32_t m_lastMspResponseMs;
+    uint32_t m_lastStatusMs;
     bool m_mspPollToggle;
     bool m_mspLinkLogged;
     bool m_mspTimeoutLogged;

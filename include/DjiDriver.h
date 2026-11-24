@@ -36,9 +36,14 @@ public:
     void sendMockGps() override;
     void sendPairingHandshake(uint8_t verifyMode = 0);
     bool shouldDisconnect() const override { return m_needsDisconnect; }
+    uint32_t getLastTelemetryMs() const override { return m_lastTelemetryMs; }
 
     const CameraTelemetry& getTelemetry() const override { return m_telemetry; }
     void setSavedMac(const uint8_t* mac) override;
+
+    uint8_t getLastPowerMode() const { return m_lastPowerMode; }
+    uint8_t getLastCamStatus() const { return m_lastCamStatus; }
+    uint32_t getLastTelemetryAgeMs(uint32_t nowMs) const { return m_lastTelemetryMs ? (nowMs - m_lastTelemetryMs) : 0; }
 
     // CRC helpers
     static uint16_t calculateCrc16(const uint8_t* data, size_t len);
@@ -71,6 +76,8 @@ private:
     bool m_needsDisconnect;
     uint32_t m_sleepRequestedMs;
     bool m_sleepPending;
+    uint8_t m_lastPowerMode;
+    uint8_t m_lastCamStatus;
 };
 
 #endif // DJI_DRIVER_H

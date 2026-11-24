@@ -4,11 +4,20 @@
 #include <cstring>
 
 BetaflightBridge::BetaflightBridge()
-    : m_isBridgeMode(false)
-    , m_tcpConnected(false)
-    , m_tcpServer(5761)
-    , m_tcpClient()
+    : m_passthroughOnly(false)
+    , m_bleConnected(false)
+    , m_bleTxCb(nullptr)
     , m_logCb(nullptr)
+    , m_bleRxHead(0)
+    , m_bleRxTail(0)
+    , m_bleRxMux(portMUX_INITIALIZER_UNLOCKED)
+    , m_bleTxHead(0)
+    , m_bleTxTail(0)
+    , m_lastUartRxMs(0)
+    , m_lastUartRxUs(0)
+    , m_lastBleTxRetryMs(0)
+    , m_bleTxChunkMax(20)
+    , m_bleResetPending(false)
     , m_rxBytes(0)
     , m_txBytes(0)
     , m_lastUsbRxMs(0)
@@ -17,6 +26,7 @@ BetaflightBridge::BetaflightBridge()
     , m_flightModeFlags(0)
     , m_lastMspPollMs(0)
     , m_lastMspResponseMs(0)
+    , m_lastStatusMs(0)
     , m_mspPollToggle(false)
     , m_mspLinkLogged(false)
     , m_mspTimeoutLogged(false)
@@ -30,19 +40,33 @@ BetaflightBridge::BetaflightBridge()
     , m_mspPayloadIdx(0)
     , m_mspChecksum(0)
 {
+    memset(m_bleRxRing, 0, sizeof(m_bleRxRing));
+    memset(m_bleTxRing, 0, sizeof(m_bleTxRing));
     memset(m_rcChannels, 0, sizeof(m_rcChannels));
     memset(m_mspPayload, 0, sizeof(m_mspPayload));
     memset(m_firstRawBytes, 0, sizeof(m_firstRawBytes));
 }
 
 BetaflightBridge::~BetaflightBridge() {
-    if (m_tcpClient) {
-        m_tcpClient.stop();
-    }
 }
 
-void BetaflightBridge::begin(bool isBridgeMode) {
-    m_isBridgeMode = isBridgeMode;
+void BetaflightBridge::pushBleRx(const uint8_t* data, size_t len) {
+    if (!data || len == 0) return;
+    portENTER_CRITICAL(&m_bleRxMux);
+    for (size_t i = 0; i < len; i++) {
+        size_t nextHead = (m_bleRxHead + 1) % BLE_RX_RING_SIZE;
+        if (nextHead != m_bleRxTail) {
+            m_bleRxRing[m_bleRxHead] = data[i];
+            m_bleRxHead = nextHead;
+        } else {
+            break; // Drop if ring buffer is full
+        }
+    }
+    portEXIT_CRITICAL(&m_bleRxMux);
+}
+
+void BetaflightBridge::begin(bool passthroughOnly) {
+    m_passthroughOnly = passthroughOnly;
 
     // Initialize Hardware UART for Flight Controller
     FC_SERIAL.setRxBufferSize(1024);
@@ -54,84 +78,40 @@ void BetaflightBridge::begin(bool isBridgeMode) {
                  FC_UART_RX_PIN, FC_UART_TX_PIN);
         m_logCb("UART", buf);
     }
-
-    if (m_isBridgeMode) {
-        m_tcpServer.begin();
-        m_tcpServer.setNoDelay(true);
-        if (m_logCb) {
-            m_logCb("BRIDGE", "Dedicated TCP Bridge listening on 192.168.4.1:5761");
-        }
-    }
 }
 
 void BetaflightBridge::loop() {
     uint32_t now = millis();
 
-    if (m_isBridgeMode) {
-        // --- Dedicated TCP Bridge Mode ---
-        // Accept new TCP client on port 5761
-        if (m_tcpServer.hasClient()) {
-            WiFiClient newClient = m_tcpServer.accept();
-            if (!m_tcpClient || !m_tcpClient.connected()) {
-                m_tcpClient = newClient;
-                m_tcpClient.setNoDelay(true);
-                if (m_logCb) {
-                    m_logCb("BRIDGE", "Configurator connected via TCP (port 5761)");
-                }
-            } else {
-                newClient.stop(); // Only 1 active configurator session at a time
+    // Reset rings and drain residual UART bytes if connection state changed
+    if (m_bleResetPending) {
+        m_bleResetPending = false;
+        m_bleTxHead = m_bleTxTail = 0;
+        m_lastBleTxRetryMs = 0;
+        portENTER_CRITICAL(&m_bleRxMux);
+        m_bleRxHead = m_bleRxTail = 0;
+        portEXIT_CRITICAL(&m_bleRxMux);
+        if (m_bleConnected) {
+            while (FC_SERIAL.available() > 0) {
+                FC_SERIAL.read();
             }
         }
-
-        m_tcpConnected = (m_tcpClient && m_tcpClient.connected());
-
-        // Drain TCP Client -> FC UART
-        if (m_tcpClient && m_tcpClient.connected()) {
-            uint8_t tcpBuf[256];
-            int tcpAvail = m_tcpClient.available();
-            if (tcpAvail > 0) {
-                int toRead = std::min<int>(tcpAvail, (int)sizeof(tcpBuf));
-                int bytesRead = m_tcpClient.read(tcpBuf, toRead);
-                if (bytesRead > 0) {
-                    FC_SERIAL.write(tcpBuf, bytesRead);
-                    m_rxBytes += bytesRead;
-                }
-            }
-        }
-
-        // Drain USB Serial (COM7 PC) -> FC UART
-        uint8_t usbBuf[128];
-        size_t usbCount = 0;
-        while (Serial.available() > 0 && usbCount < sizeof(usbBuf)) {
-            usbBuf[usbCount++] = (uint8_t)Serial.read();
-        }
-        if (usbCount > 0) {
-            m_lastUsbRxMs = now;
-            FC_SERIAL.write(usbBuf, usbCount);
-            m_rxBytes += usbCount;
-        }
-
-        // Drain FC UART -> TCP Client & USB Serial
-        uint8_t uartBuf[256];
-        size_t uartCount = 0;
-        while (FC_SERIAL.available() > 0 && uartCount < sizeof(uartBuf)) {
-            uartBuf[uartCount++] = (uint8_t)FC_SERIAL.read();
-        }
-        if (uartCount > 0) {
-            if (m_tcpClient && m_tcpClient.connected()) {
-                m_tcpClient.write(uartBuf, uartCount);
-            }
-            if (Serial && Serial.availableForWrite() >= (int)uartCount) {
-                Serial.write(uartBuf, uartCount);
-            }
-            m_txBytes += uartCount;
-        }
-
-        // Pause internal MSP polling in bridge mode
-        return;
     }
 
-    // --- Normal Camera Mode ---
+    // Drain BLE RX ring -> FC UART on loopTask
+    uint8_t bleRxBuf[128];
+    size_t bleRxCount = 0;
+    portENTER_CRITICAL(&m_bleRxMux);
+    while (m_bleRxTail != m_bleRxHead && bleRxCount < sizeof(bleRxBuf)) {
+        bleRxBuf[bleRxCount++] = m_bleRxRing[m_bleRxTail];
+        m_bleRxTail = (m_bleRxTail + 1) % BLE_RX_RING_SIZE;
+    }
+    portEXIT_CRITICAL(&m_bleRxMux);
+    if (bleRxCount > 0) {
+        FC_SERIAL.write(bleRxBuf, bleRxCount);
+        m_rxBytes += bleRxCount;
+    }
+
     // 1. Drain USB Serial (COM7 PC) -> FC UART
     uint8_t usbBuf[128];
     size_t usbCount = 0;
@@ -144,15 +124,43 @@ void BetaflightBridge::loop() {
         m_rxBytes += usbCount;
     }
 
-    // 2. Read FC UART -> Feed MSP Parser & Passthrough to USB Serial
-    uint8_t uartBuf[128];
+    // 2. Read FC UART -> Forward to BLE & USB Serial & Feed MSP Parser
+    uint8_t uartBuf[256];
     size_t uartCount = 0;
     while (FC_SERIAL.available() > 0 && uartCount < sizeof(uartBuf)) {
         uartBuf[uartCount++] = (uint8_t)FC_SERIAL.read();
     }
     if (uartCount > 0) {
+        m_txBytes += uartCount;
+
+        if (m_bleConnected && m_bleTxCb) {
+            for (size_t i = 0; i < uartCount; i++) {
+                size_t nextHead = (m_bleTxHead + 1) % BLE_TX_RING_SIZE;
+                if (nextHead != m_bleTxTail) {
+                    m_bleTxRing[m_bleTxHead] = uartBuf[i];
+                    m_bleTxHead = nextHead;
+                } else break;
+            }
+            m_lastUartRxMs = now;
+            m_lastUartRxUs = micros();
+        }
+
+        bool isUsbConfigActive = (m_lastUsbRxMs > 0 && (now - m_lastUsbRxMs < 1500));
+
+        // Forward raw FC UART to USB Serial ONLY when PC Betaflight Configurator is actively communicating via USB
+        if (isUsbConfigActive && Serial && Serial.availableForWrite() >= (int)uartCount) {
+            Serial.write(uartBuf, uartCount);
+        }
+
+        // Feed MSP Parser only when not in passthrough, BLE bridge, or USB config
+        if (!m_passthroughOnly && !m_bleConnected && !isUsbConfigActive) {
+            for (size_t i = 0; i < uartCount; i++) {
+                processMspByte(uartBuf[i]);
+            }
+        }
+
         // Raw UART diagnostics: track bytes arriving with no valid MSP
-        if (!m_fcConnected) {
+        if (!m_fcConnected && !m_passthroughOnly && !m_bleConnected && !isUsbConfigActive) {
             for (size_t i = 0; i < uartCount && m_firstRawCount < 8; i++) {
                 m_firstRawBytes[m_firstRawCount++] = uartBuf[i];
             }
@@ -169,21 +177,44 @@ void BetaflightBridge::loop() {
                     m_logCb("UART", diagMsg);
                 }
             }
+        } else if (m_fcConnected) {
+            m_rawBytesWithoutMsp = 0;
+            m_firstRawCount = 0;
+            m_rawDiagLogged = false;
         }
-
-        for (size_t i = 0; i < uartCount; i++) {
-            processMspByte(uartBuf[i]);
-        }
-        if (Serial && Serial.availableForWrite() >= (int)uartCount) {
-            Serial.write(uartBuf, uartCount);
-        }
-        m_txBytes += uartCount;
     }
 
-    // 3. Alternate MSP Polling: MSP_STATUS (101) & MSP_RC (105) every 100ms (5 Hz each)
-    // Only poll when PC USB Configurator is not actively writing to the UART
+    // BLE TX Flush Step: Forward UART data to BLE with zero artificial latency
+    while (m_bleConnected && m_bleTxCb) {
+        size_t buffered = (m_bleTxHead >= m_bleTxTail) ? (m_bleTxHead - m_bleTxTail) : (BLE_TX_RING_SIZE - m_bleTxTail + m_bleTxHead);
+        if (buffered == 0) {
+            break;
+        }
+        if (m_lastBleTxRetryMs > 0 && (now - m_lastBleTxRetryMs < 1)) {
+            break;
+        }
+        // Only wait to coalesce when packet is smaller than chunk max and more bytes are actively arriving
+        if (buffered < m_bleTxChunkMax && (FC_SERIAL.available() > 0 || (uint32_t)(micros() - m_lastUartRxUs) < 1200UL)) {
+            break;
+        }
+        size_t toSend = std::min<size_t>(buffered, m_bleTxChunkMax);
+        uint8_t chunk[244];
+        for (size_t i = 0; i < toSend; i++) {
+            chunk[i] = m_bleTxRing[(m_bleTxTail + i) % BLE_TX_RING_SIZE];
+        }
+        if (m_bleTxCb(chunk, toSend)) {
+            m_bleTxTail = (m_bleTxTail + toSend) % BLE_TX_RING_SIZE;
+            m_lastBleTxRetryMs = 0;
+        } else {
+            m_lastBleTxRetryMs = now;
+            break;
+        }
+    }
+
+    // 4. Alternate MSP Polling: MSP_STATUS (101) & MSP_RC (105) every 100ms (5 Hz each)
+    // Run ONLY when !m_passthroughOnly && !m_bleConnected && !isUsbConfigActive
     bool isUsbConfigActive = (m_lastUsbRxMs > 0 && (now - m_lastUsbRxMs < 1500));
-    if (!isUsbConfigActive) {
+    if (!m_passthroughOnly && !m_bleConnected && !isUsbConfigActive) {
         if (now - m_lastMspPollMs >= 100) {
             m_lastMspPollMs = now;
             m_mspPollToggle = !m_mspPollToggle;
@@ -191,26 +222,25 @@ void BetaflightBridge::loop() {
                 // MSP_STATUS (101): $M<\0\x65\x65
                 static const uint8_t mspStatusReq[6] = {0x24, 0x4D, 0x3C, 0x00, 0x65, 0x65};
                 FC_SERIAL.write(mspStatusReq, sizeof(mspStatusReq));
-                m_rxBytes += sizeof(mspStatusReq);
             } else {
                 // MSP_RC (105): $M<\0\x69\x69
                 static const uint8_t mspRcReq[6] = {0x24, 0x4D, 0x3C, 0x00, 0x69, 0x69};
                 FC_SERIAL.write(mspRcReq, sizeof(mspRcReq));
-                m_rxBytes += sizeof(mspRcReq);
             }
         }
-    }
 
-    // 4. FC Connection Watchdog
-    if (m_fcConnected && (now - m_lastMspResponseMs > 1500)) {
-        m_fcConnected = false;
-    }
+        // FC Connection Watchdog
+        now = millis();
+        if (m_fcConnected && (int32_t)(now - m_lastMspResponseMs) > 1500) {
+            m_fcConnected = false;
+        }
 
-    if (now - m_lastMspResponseMs > 3500 && m_lastMspResponseMs > 0) {
-        if (!m_mspTimeoutLogged) {
-            m_mspTimeoutLogged = true;
-            if (m_logCb) {
-                m_logCb("MSP", "Warning: FC telemetry silent (>3.5s); recording continues");
+        if (m_lastMspResponseMs > 0 && (int32_t)(now - m_lastMspResponseMs) > 3500) {
+            if (!m_mspTimeoutLogged) {
+                m_mspTimeoutLogged = true;
+                if (m_logCb) {
+                    m_logCb("MSP", "Warning: FC telemetry silent (>3.5s); recording continues");
+                }
             }
         }
     }
@@ -241,8 +271,6 @@ void BetaflightBridge::processMspByte(uint8_t b) {
         case MSP_HEADER_ARROW:
             if (b == '>') {
                 m_mspState = MSP_SIZE;
-            } else if (b == '$') {
-                m_mspState = MSP_HEADER_M;
             } else {
                 m_mspState = MSP_IDLE;
             }
@@ -250,22 +278,23 @@ void BetaflightBridge::processMspByte(uint8_t b) {
         case MSP_SIZE:
             m_mspSize = b;
             m_mspChecksum = b;
+            m_mspPayloadIdx = 0;
             m_mspState = MSP_CMD;
             break;
         case MSP_CMD:
             m_mspCmd = b;
             m_mspChecksum ^= b;
-            m_mspPayloadIdx = 0;
-            if (m_mspSize == 0) {
-                m_mspState = MSP_CHECKSUM;
-            } else if (m_mspSize <= sizeof(m_mspPayload)) {
+            if (m_mspSize > 0) {
                 m_mspState = MSP_PAYLOAD;
             } else {
-                m_mspState = MSP_IDLE;
+                m_mspState = MSP_CHECKSUM;
             }
             break;
         case MSP_PAYLOAD:
-            m_mspPayload[m_mspPayloadIdx++] = b;
+            if (m_mspPayloadIdx < sizeof(m_mspPayload)) {
+                m_mspPayload[m_mspPayloadIdx] = b;
+            }
+            m_mspPayloadIdx++;
             m_mspChecksum ^= b;
             if (m_mspPayloadIdx >= m_mspSize) {
                 m_mspState = MSP_CHECKSUM;
@@ -277,48 +306,46 @@ void BetaflightBridge::processMspByte(uint8_t b) {
             }
             m_mspState = MSP_IDLE;
             break;
-        default:
-            m_mspState = MSP_IDLE;
-            break;
     }
 }
 
 void BetaflightBridge::handleMspPacket(uint8_t cmd, const uint8_t* payload, uint8_t size) {
-    bool wasConnected = m_fcConnected;
     m_lastMspResponseMs = millis();
-    m_fcConnected = true;
     m_mspTimeoutLogged = false;
-    m_rawBytesWithoutMsp = 0;
-    m_rawDiagLogged = false;
-    m_firstRawCount = 0;
+
+    if (!m_fcConnected) {
+        m_fcConnected = true;
+        if (m_logCb) {
+            m_logCb("MSP", "FC link online (valid telemetry response received)");
+        }
+    }
 
     // 101 = MSP_STATUS, 150 = MSP_STATUS_EX
     if ((cmd == 101 || cmd == 150) && size >= 10) {
+        m_lastStatusMs = millis();
         m_flightModeFlags = (uint32_t)payload[6] |
                            ((uint32_t)payload[7] << 8) |
                            ((uint32_t)payload[8] << 16) |
                            ((uint32_t)payload[9] << 24);
 
         m_isArmed = (m_flightModeFlags & 0x00000001UL) != 0;
-    }
 
-    // 105 = MSP_RC
-    if (cmd == 105 && size >= 16) {
-        size_t numChannels = std::min<size_t>(size / 2, 12);
-        for (size_t i = 0; i < numChannels; i++) {
-            m_rcChannels[i] = (uint16_t)payload[2 * i] | ((uint16_t)payload[2 * i + 1] << 8);
+        if (!m_mspLinkLogged) {
+            m_mspLinkLogged = true;
+            if (m_logCb) {
+                char dbg[96];
+                snprintf(dbg, sizeof(dbg), "MSP link verified: cmd=%u, size=%u, flags=0x%08lX (armBit=%d)",
+                         cmd, size, (unsigned long)m_flightModeFlags, (int)m_isArmed);
+                m_logCb("MSP", dbg);
+            }
         }
     }
-
-    // Re-log whenever m_fcConnected transitions from false to true (not just once per boot)
-    if (!wasConnected) {
-        if (m_logCb) {
-            char msg[128];
-            snprintf(msg, sizeof(msg),
-                     "FC link online: cmd=%u arm=%s flags=0x%08lX AUX1=%u AUX2=%u AUX3=%u AUX4=%u",
-                     cmd, m_isArmed ? "YES" : "NO", (unsigned long)m_flightModeFlags,
-                     m_rcChannels[4], m_rcChannels[5], m_rcChannels[6], m_rcChannels[7]);
-            m_logCb("MSP", msg);
+    // 105 = MSP_RC
+    else if (cmd == 105 && size >= 8) {
+        uint8_t numChannels = size / 2;
+        if (numChannels > 12) numChannels = 12;
+        for (uint8_t i = 0; i < numChannels; i++) {
+            m_rcChannels[i] = (uint16_t)payload[i * 2] | ((uint16_t)payload[i * 2 + 1] << 8);
         }
     }
 }

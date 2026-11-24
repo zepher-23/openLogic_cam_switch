@@ -468,10 +468,12 @@ static const char DASHBOARD_HTML[] = R"rawliteral(<!DOCTYPE html>
         <span class="badge" id="bf-bridge-badge">OFFLINE</span>
       </div>
 
-      <!-- TCP Bridge Banner (shown when bridgeMode is active) -->
-      <div id="bridge-active-banner" class="hidden" style="background:#141414; border:1px solid #333333; padding:10px; margin-bottom:12px; font-family:var(--mono); font-size:11px; color:#ffffff; line-height:1.4;">
-        TCP BRIDGE ACTIVE — Connect Betaflight Configurator to <b>tcp://192.168.4.1:5761</b><br>
-        <span style="color:var(--muted); font-size:10px;">(BLE camera paused; click Exit or power-cycle to resume camera mode)</span>
+      <!-- Setup Mode & Betaflight BLE Banner -->
+      <div id="bridge-active-banner" style="background:#141414; border:1px solid #333333; padding:12px; margin-bottom:12px; font-family:var(--mono); font-size:11px; color:#ffffff; line-height:1.5;">
+        <b>WI-FI SETUP MODE</b> — BLE radio is paused while Wi-Fi web configuration is active.<br>
+        To connect Betaflight Configurator over BLE via <b>app.betaflight.com</b> (device: <b>OpenLogic_BF</b>):<br>
+        • Directly in <b>Flight Mode</b> while disarmed (DJI / GoPro)<br>
+        • Or click <b>ENTER BETAFLIGHT BLE MODE</b> below (works for all cameras including Insta360).
       </div>
 
       <div class="stat-grid">
@@ -488,8 +490,8 @@ static const char DASHBOARD_HTML[] = R"rawliteral(<!DOCTYPE html>
           <div class="stat-val" id="bf-aux-val">--</div>
         </div>
         <div class="stat-box">
-          <div class="stat-label">TCP BRIDGE</div>
-          <div class="stat-val" id="bf-tcp-status">OFF</div>
+          <div class="stat-label">BLE BRIDGE</div>
+          <div class="stat-val" id="bf-ble-status">READY</div>
         </div>
         <div class="stat-box">
           <div class="stat-label">UART RX BYTES</div>
@@ -502,11 +504,11 @@ static const char DASHBOARD_HTML[] = R"rawliteral(<!DOCTYPE html>
       </div>
 
       <div style="margin-top: 12px; display: grid; gap: 8px;">
-        <button class="btn btn-primary" id="btn-tcp-bridge" onclick="toggleTcpBridge()">ENTER TCP BRIDGE (192.168.4.1:5761)</button>
+        <button class="btn btn-primary" id="btn-start-flight" onclick="startFlightMode()">SAVE &amp; START FLIGHT MODE (BLE)</button>
+        <button class="btn" id="btn-enter-bf-ble" onclick="enterBfBleMode()">ENTER BETAFLIGHT BLE MODE (app.betaflight.com)</button>
 
         <div style="display:flex; gap:8px;">
           <button class="btn" id="btn-auto-arm" onclick="toggleAutoArm()">AUTO-REC ON ARM: ON</button>
-          <button class="btn" id="btn-wifi-arm" onclick="toggleWifiOffArm()">WIFI OFF WHEN ARMED: OFF</button>
         </div>
 
         <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">
@@ -559,19 +561,17 @@ let lastLogId = 0;
 let pendingSwitch = false;
 let ws = null;
 let wsReconnectTimer = null;
-let isBridgeMode = false;
 let currentAutoArm = true;
-let currentWifiArm = false;
 
-function toggleTcpBridge() {
-  if (isBridgeMode) {
-    postAction('exit_bridge');
-    showToast('Exiting TCP bridge; rebooting into Camera Mode in 250ms...');
-  } else {
-    if (confirm('Enter dedicated TCP Bridge mode?\n\nThis will reboot the controller into Wi-Fi TCP mode on 192.168.4.1:5761.\nCamera BLE will be paused until you exit or power-cycle.')) {
-      postAction('enter_bridge');
-      showToast('Rebooting into TCP Bridge Mode in 250ms...');
-    }
+function startFlightMode() {
+  postAction('start_flight');
+  showToast('Rebooting into BLE Flight Mode in 250ms...');
+}
+
+function enterBfBleMode() {
+  if (confirm('Enter dedicated Betaflight BLE Bridge mode?\n\nThis will reboot into BLE NUS Peripheral mode (OpenLogic_BF) for app.betaflight.com.\nCamera BLE and Wi-Fi will be paused.')) {
+    postAction('enter_bf_ble');
+    showToast('Rebooting into Betaflight BLE Mode in 250ms...');
   }
 }
 
@@ -579,12 +579,6 @@ function toggleAutoArm() {
   currentAutoArm = !currentAutoArm;
   postAction('set_auto_arm', currentAutoArm ? '1' : '0');
   showToast('Auto-Rec on Arm: ' + (currentAutoArm ? 'ENABLED' : 'DISABLED'));
-}
-
-function toggleWifiOffArm() {
-  currentWifiArm = !currentWifiArm;
-  postAction('set_wifi_off_arm', currentWifiArm ? '1' : '0');
-  showToast('Wi-Fi Off When Armed: ' + (currentWifiArm ? 'ENABLED' : 'DISABLED'));
 }
 
 function showToast(msg) {
@@ -622,9 +616,9 @@ function renderCameraUI(brand) {
 
 function selectCamera(brand) {
   currentBrand = brand;
-  pendingSwitch = true;
+  pendingSwitch = false;
   renderCameraUI(brand);
-  showToast('Switching brand; restarting controller in 250ms...');
+  showToast('Camera brand selected & saved to NVS');
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ cmd: 'select_cam', val: String(brand) }));
@@ -856,41 +850,24 @@ function applyState(d) {
   }
 
   // Betaflight Bridge & MSP Telemetry State Sync
-  isBridgeMode = !!d.bridgeMode;
-
   const bridgeBadge = document.getElementById('bf-bridge-badge');
-  const bridgeBanner = document.getElementById('bridge-active-banner');
   const fcStatus = document.getElementById('bf-fc-status');
   const armStatus = document.getElementById('bf-arm-status');
   const auxVal = document.getElementById('bf-aux-val');
-  const tcpStatus = document.getElementById('bf-tcp-status');
+  const bleStatus = document.getElementById('bf-ble-status');
   const rxBytes = document.getElementById('bf-rx-bytes');
   const txBytes = document.getElementById('bf-tx-bytes');
-  const btnBridge = document.getElementById('btn-tcp-bridge');
   const btnAutoArm = document.getElementById('btn-auto-arm');
-  const btnWifiArm = document.getElementById('btn-wifi-arm');
   const selDisarmDly = document.getElementById('sel-disarm-dly');
   const selAuxCh = document.getElementById('sel-aux-ch');
 
-  if (bridgeBanner) {
-    bridgeBanner.classList.toggle('hidden', !isBridgeMode);
-  }
-
   if (bridgeBadge) {
-    if (isBridgeMode) {
-      bridgeBadge.innerText = d.bfConnected ? 'TCP CONNECTED' : 'TCP LISTENING';
+    if (d.bootMode === 2) {
+      bridgeBadge.innerText = d.bfConnected ? 'BLE CONNECTED' : 'BLE ADVERTISING';
       bridgeBadge.className = 'badge badge-live';
-    } else if (d.fcConnected) {
-      if (d.fcArmed) {
-        bridgeBadge.innerText = 'ARMED';
-        bridgeBadge.className = 'badge badge-rec';
-      } else {
-        bridgeBadge.innerText = 'MSP ONLINE';
-        bridgeBadge.className = 'badge badge-live';
-      }
     } else {
-      bridgeBadge.innerText = 'OFFLINE';
-      bridgeBadge.className = 'badge';
+      bridgeBadge.innerText = d.bfConnected ? 'BLE CONNECTED' : 'SETUP MODE';
+      bridgeBadge.className = d.bfConnected ? 'badge badge-live' : 'badge';
     }
   }
 
@@ -914,14 +891,9 @@ function applyState(d) {
     }
   }
 
-  if (tcpStatus) {
-    if (isBridgeMode) {
-      tcpStatus.innerText = d.bfConnected ? 'CONNECTED' : 'PORT 5761';
-      tcpStatus.style.color = '#ffffff';
-    } else {
-      tcpStatus.innerText = 'OFF';
-      tcpStatus.style.color = 'var(--muted)';
-    }
+  if (bleStatus) {
+    bleStatus.innerText = d.bfConnected ? 'CONNECTED' : (d.bootMode === 2 ? 'ADVERTISING' : 'READY');
+    bleStatus.style.color = d.bfConnected ? '#22c55e' : '#ffffff';
   }
 
   if (rxBytes && d.bfRxBytes !== undefined) {
@@ -931,26 +903,10 @@ function applyState(d) {
     txBytes.innerText = d.bfTxBytes + ' B';
   }
 
-  if (btnBridge) {
-    if (isBridgeMode) {
-      btnBridge.innerText = 'EXIT TCP BRIDGE (RETURN TO CAMERA MODE)';
-      btnBridge.className = 'btn btn-danger';
-    } else {
-      btnBridge.innerText = 'ENTER TCP BRIDGE (192.168.4.1:5761)';
-      btnBridge.className = 'btn btn-primary';
-    }
-  }
-
   if (btnAutoArm && d.autoRecArm !== undefined) {
     currentAutoArm = !!d.autoRecArm;
     btnAutoArm.innerText = 'AUTO-REC ON ARM: ' + (currentAutoArm ? 'ON' : 'OFF');
     btnAutoArm.style.borderColor = currentAutoArm ? '#ffffff' : '#333333';
-  }
-
-  if (btnWifiArm && d.wifiOffArm !== undefined) {
-    currentWifiArm = !!d.wifiOffArm;
-    btnWifiArm.innerText = 'WIFI OFF WHEN ARMED: ' + (currentWifiArm ? 'ON' : 'OFF');
-    btnWifiArm.style.borderColor = currentWifiArm ? '#ffffff' : '#333333';
   }
 
   if (selDisarmDly && d.disarmDelaySec !== undefined && document.activeElement !== selDisarmDly) {
