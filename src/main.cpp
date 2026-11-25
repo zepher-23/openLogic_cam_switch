@@ -173,6 +173,8 @@ static uint32_t g_restartTargetMs = 0;
 // Host-Task Thread-Safety Flags
 static volatile bool g_disconnectPending = false;
 static volatile int g_lastDisconnectReason = 0;
+static volatile bool g_connectFailPending = false;
+static volatile int g_lastConnectFailReason = 0;
 static uint32_t g_bleScanAllowedAfterMs = 0;
 static volatile uint32_t g_telemetryVersion = 1;
 static bool g_explicitSleepRequested = false;
@@ -184,6 +186,7 @@ static bool s_diagPairedLoggedThisSession = false;
 static uint32_t g_camPairedAtMs = 0;
 static uint32_t g_lastDisconnectMs = 0;
 static uint32_t s_cameraConnBackoffUntilMs = 0;
+static bool s_expectingShutdownDisconnect = false;
 
 // 6-Event Diagnostics Trail (Flushed to NVS on disconnect)
 static char s_diagLines[6][64];
@@ -223,6 +226,9 @@ static void appendDiagEvent(const char* line, bool flushToNvs) {
 // WKP Wake Broadcast State
 static bool isBroadcastingWake = false;
 static uint32_t wakeBroadcastStartMs = 0;
+static bool s_wkpSwappedToMsb = false;
+static bool s_wkpScanStarted = false;
+static uint8_t s_wkpMsbMac[6] = {0};
 
 // Non-Blocking Connection State Machine
 enum ConnStep {
@@ -283,6 +289,7 @@ static void startBleScan();
 static void selectCameraBrand(CameraBrand brand, bool reboot = false);
 static void startWkpWakeBroadcast();
 static void stopWkpWakeBroadcast();
+static void handleWkpWakeLoop(uint32_t now);
 static void configureNusAdvertising();
 static void clearSavedMacActiveBrand();
 
@@ -457,6 +464,11 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         addLog("BLE", "GATT physical link connected");
     }
 
+    void onConnectFail(NimBLEClient* client, int reason) override {
+        g_lastConnectFailReason = reason;
+        g_connectFailPending = true;
+    }
+
     void onDisconnect(NimBLEClient* client, int reason) override {
         // Defer state mutation and scan restart to loopTask
         g_lastDisconnectReason = reason;
@@ -464,7 +476,7 @@ class ClientCallbacks : public NimBLEClientCallbacks {
     }
 
     bool onConnParamsUpdateRequest(NimBLEClient* client, const ble_gap_upd_params* params) override {
-        if (params && params->supervision_timeout < 200) {
+        if (params && params->supervision_timeout < 500) {
             return false;
         }
         return true;
@@ -505,6 +517,7 @@ static bool resolveCameraCharacteristics() {
         NimBLEUUID djiSvc(static_cast<uint16_t>(0xFFF0));
         NimBLERemoteService* pSvc = pClient->getService(djiSvc);
         if (pSvc) {
+            pSvc->getCharacteristics(true); // Cache all characteristics in a single ATT round-trip
             pNotifyChar = pSvc->getCharacteristic(NimBLEUUID(static_cast<uint16_t>(0xFFF4)));
             pWriteChar  = pSvc->getCharacteristic(NimBLEUUID(static_cast<uint16_t>(0xFFF5)));
         }
@@ -513,6 +526,7 @@ static bool resolveCameraCharacteristics() {
         NimBLEUUID goproSvc(static_cast<uint16_t>(0xFEA6));
         NimBLERemoteService* pSvc = pClient->getService(goproSvc);
         if (pSvc) {
+            pSvc->getCharacteristics(true); // Cache all characteristics in a single ATT round-trip
             // Command pair: 0072 (write), 0073 (notify)
             pWriteChar               = pSvc->getCharacteristic(NimBLEUUID("b5f90072-aa8d-11e3-9046-0002a5d5c51b"));
             pNotifyChar              = pSvc->getCharacteristic(NimBLEUUID("b5f90073-aa8d-11e3-9046-0002a5d5c51b"));
@@ -551,30 +565,78 @@ static void subscribeCameraNotifications() {
 // BLE Scan Callbacks (Central mode)
 // ============================================================================
 class ScanCallbacks : public NimBLEScanCallbacks {
-    void onDiscovered(const NimBLEAdvertisedDevice* advertisedDevice) override {
-        if (connStep != CONN_IDLE || (pClient && pClient->isConnected())) return;
+    void handleDiscoveredDevice(const NimBLEAdvertisedDevice* advertisedDevice) {
+        if (!advertisedDevice || connStep != CONN_IDLE || (pClient && pClient->isConnected())) return;
 
         uint32_t now = millis();
+        NimBLEAddress addr = advertisedDevice->getAddress();
+        bool isSavedMatch = hasSavedMacForActiveBrand && hasTargetAddress &&
+                            (addr == targetAddress || memcmp(addr.getVal(), targetAddress.getVal(), 6) == 0);
+
+        bool hasFullName = advertisedDevice->haveName() && !advertisedDevice->getName().empty();
+        bool hasShortName = advertisedDevice->haveType(BLE_HS_ADV_TYPE_INCOMP_NAME);
+        bool hasTargetUuid = advertisedDevice->isAdvertisingService(NimBLEUUID((uint16_t)0xFFF0)) ||
+                             advertisedDevice->isAdvertisingService(NimBLEUUID((uint16_t)0xFEA6));
+        bool isAwakeAdv = hasFullName || hasShortName || hasTargetUuid;
+
+        if (isSavedMatch) {
+            std::string mfg = advertisedDevice->getManufacturerData();
+            const uint8_t* mfgPtr = reinterpret_cast<const uint8_t*>(mfg.data());
+            size_t mfgLen = mfg.length();
+            uint8_t advType = advertisedDevice->getAdvType();
+            bool isConn = advertisedDevice->isConnectable();
+            int32_t bo = (int32_t)(s_cameraConnBackoffUntilMs - now);
+
+            static uint32_t s_lastMacLogMs = 0;
+            static uint8_t s_lastAdvType = 0xFF;
+            static bool s_lastConn = false;
+            static bool s_lastAwake = false;
+            static size_t s_lastMfgLen = 0;
+            static uint8_t s_lastMfgHead[16] = {0};
+
+            size_t cmpLen = (mfgLen < sizeof(s_lastMfgHead)) ? mfgLen : sizeof(s_lastMfgHead);
+            bool changed = (advType != s_lastAdvType) || (isConn != s_lastConn) ||
+                           (isAwakeAdv != s_lastAwake) || (mfgLen != s_lastMfgLen) ||
+                           (cmpLen > 0 && memcmp(mfgPtr, s_lastMfgHead, cmpLen) != 0);
+
+            if (changed || (now - s_lastMacLogMs >= 500UL)) {
+                s_lastMacLogMs = now;
+                s_lastAdvType = advType;
+                s_lastConn = isConn;
+                s_lastAwake = isAwakeAdv;
+                s_lastMfgLen = mfgLen;
+                if (cmpLen > 0) memcpy(s_lastMfgHead, mfgPtr, cmpLen);
+
+                char mfgHex[52] = "--";
+                if (cmpLen > 0) {
+                    size_t pos = 0;
+                    for (size_t i = 0; i < cmpLen && pos + 3 < sizeof(mfgHex); i++) {
+                        pos += snprintf(mfgHex + pos, sizeof(mfgHex) - pos, "%s%02X", (i > 0 ? " " : ""), mfgPtr[i]);
+                    }
+                }
+                std::string nameStr = hasFullName ? advertisedDevice->getName() :
+                                      (hasShortName ? advertisedDevice->getPayloadByType(BLE_HS_ADV_TYPE_INCOMP_NAME) : "");
+                if (Serial && Serial.availableForWrite() >= 96) {
+                    Serial.printf("[%lu][SCAN-MAC] type=%u conn=%d awake=%d name=\"%s\" uuid=%d bo=%ldms rssi=%d mfg(%u)=[%s]\r\n",
+                                  (unsigned long)now, (unsigned)advType, isConn ? 1 : 0, isAwakeAdv ? 1 : 0,
+                                  nameStr.c_str(), hasTargetUuid ? 1 : 0,
+                                  (long)(bo > 0 ? bo : 0), advertisedDevice->getRSSI(),
+                                  (unsigned)mfgLen, mfgHex);
+                }
+            }
+        }
+
         if ((int32_t)(now - s_cameraConnBackoffUntilMs) < 0) return;
 
         // Ignore raw standby/manufacturer beacons from sleeping cameras.
         // Only initiate connection if the camera is actively broadcasting its name or service.
-        bool isAwakeAdv = false;
-        if (advertisedDevice->haveName() && !advertisedDevice->getName().empty()) {
-            isAwakeAdv = true;
-        } else if (advertisedDevice->isAdvertisingService(NimBLEUUID((uint16_t)0xFFF0)) ||
-                   advertisedDevice->isAdvertisingService(NimBLEUUID((uint16_t)0xFEA6))) {
-            isAwakeAdv = true;
-        }
         if (!isAwakeAdv) {
             return;
         }
 
-        NimBLEAddress addr = advertisedDevice->getAddress();
-
         // 1. If saved MAC exists for active brand, prioritize matching that MAC immediately
         if (hasSavedMacForActiveBrand && hasTargetAddress) {
-            if (addr == targetAddress || memcmp(addr.getVal(), targetAddress.getVal(), 6) == 0) {
+            if (isSavedMatch) {
                 targetAddress = addr;
                 char buf[64];
                 snprintf(buf, sizeof(buf), "Matched saved %s [%s]", g_activeDriver->getBrandName(), addr.toString().c_str());
@@ -627,6 +689,14 @@ class ScanCallbacks : public NimBLEScanCallbacks {
             g_telemetryVersion++;
             portEXIT_CRITICAL(&g_telemetryMux);
         }
+    }
+
+    void onDiscovered(const NimBLEAdvertisedDevice* advertisedDevice) override {
+        handleDiscoveredDevice(advertisedDevice);
+    }
+
+    void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+        handleDiscoveredDevice(advertisedDevice);
     }
 };
 
@@ -864,6 +934,8 @@ static void runConnectionStateMachine(uint32_t now) {
             s_macSavedThisSession = false;
             s_diagPairedLoggedThisSession = false;
             g_explicitSleepRequested = false;
+            s_expectingShutdownDisconnect = false;
+            g_connectFailPending = false;
             addLog("BLE", ("Connecting to " + targetAddress.toString() + "...").c_str());
 
             if (!pClient) {
@@ -886,19 +958,19 @@ static void runConnectionStateMachine(uint32_t now) {
                 NimBLEDevice::setSecurityAuth(0);
             }
 
-            pClient->setConnectionParams(12, 24, 0, 200);
+            // 20-40ms avoids 0x3E cold-boot establishment retries on DJI; 6.0s supervision timeout
+            pClient->setConnectionParams(16, 32, 0, 600);
 #if CONFIG_BT_NIMBLE_EXT_ADV
             pClient->setConnectPhy(BLE_GAP_LE_PHY_1M_MASK);
 #endif
-            ble_gap_set_prefered_default_le_phy(BLE_GAP_LE_PHY_1M_MASK, BLE_GAP_LE_PHY_1M_MASK);
 
-            connStateTimerMs = now;
+            connStateTimerMs = millis();
             connStep = CONN_AWAIT_CONNECT;
             g_telemetryVersion++;
 
             if (!pClient->connect(targetAddress, true, true, true)) {
                 addLog("BLE", "GATT connect initiate failed");
-                s_cameraConnBackoffUntilMs = now + 800UL;
+                s_cameraConnBackoffUntilMs = millis() + 800UL;
                 connStep = CONN_IDLE;
                 g_telemetryVersion++;
                 startBleScan();
@@ -912,8 +984,17 @@ static void runConnectionStateMachine(uint32_t now) {
                 connStateTimerMs = now;
                 connStep = CONN_AWAIT_SETTLE;
                 g_telemetryVersion++;
-            } else if (now - connStateTimerMs >= 7000) {
-                addLog("BLE", "GATT connect timed out (7000ms)");
+            } else if (g_connectFailPending) {
+                g_connectFailPending = false;
+                char failMsg[64];
+                snprintf(failMsg, sizeof(failMsg), "GATT connect failed (reason=0x%02X)", (unsigned)g_lastConnectFailReason);
+                addLog("BLE", failMsg);
+                s_cameraConnBackoffUntilMs = now + 200UL;
+                connStep = CONN_IDLE;
+                g_telemetryVersion++;
+                startBleScan();
+            } else if ((int32_t)(now - connStateTimerMs) >= 5000) {
+                addLog("BLE", "GATT connect timed out (5000ms)");
                 pClient->cancelConnect();
                 if (pClient->isConnected()) {
                     pClient->disconnect();
@@ -1020,7 +1101,8 @@ static void runConnectionStateMachine(uint32_t now) {
         }
 
         case CONN_AWAIT_CCCD: {
-            if (now - connStateTimerMs >= 60) {
+            uint32_t cccdSettle = (g_activeBrand == BRAND_GOPRO) ? 60 : 10;
+            if ((int32_t)(now - connStateTimerMs) >= (int32_t)cccdSettle) {
                 if (!pClient->isConnected()) {
                     connStep = CONN_IDLE;
                     g_telemetryVersion++;
@@ -1066,14 +1148,14 @@ static void startBleScan() {
     pScan->setActiveScan(true); // Active scan so cameras advertising name/UUID in Scan Response are discovered
     NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
     if (pAdv && pAdv->isAdvertising()) {
-        pScan->setInterval(80);  // 80 * 0.625ms = 50ms interval
-        pScan->setWindow(40);    // 50% duty cycle: fast packet capture while coexisting with NUS adv
+        pScan->setInterval(40);  // 40 * 0.625ms = 25ms interval
+        pScan->setWindow(32);    // 80% duty cycle: fast discovery while coexisting with NUS adv
     } else {
-        pScan->setInterval(48);  // 48 * 0.625ms = 30ms interval
-        pScan->setWindow(36);    // 75% duty cycle (25% radio handoff gap)
+        pScan->setInterval(32);  // 32 * 0.625ms = 20ms interval
+        pScan->setWindow(28);    // 87.5% duty cycle for fast camera connect/reconnect
     }
     pScan->setMaxResults(16);
-    pScan->start(2000, false);   // Scan for 2.0 seconds then stop to yield radio
+    pScan->start(600, false);    // 600ms window refreshes duplicate cache rapidly for booting cameras
     lastScanRestartMs = millis();
 }
 
@@ -1108,10 +1190,11 @@ static void selectCameraBrand(CameraBrand brand, bool reboot) {
 // ============================================================================
 static void startWkpWakeBroadcast() {
     if (isBroadcastingWake) return;
-    NimBLEDevice::getScan()->stop();
 
-    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
-    pAdv->stop();
+    if (g_bootMode == MODE_WIFI_SETUP) {
+        addLog("WAKE", "BLE is disabled in Wi-Fi Setup Mode to prevent RF interference. Use Flight Mode.");
+        return;
+    }
 
     uint8_t msbMac[6] = {0};
     bool macFound = false;
@@ -1130,54 +1213,181 @@ static void startWkpWakeBroadcast() {
             macFound = true;
         }
     }
+    if (!macFound) {
+        if (prefs.getBytes("mac_dji", msbMac, 6) == 6 &&
+            (msbMac[0] || msbMac[1] || msbMac[2] || msbMac[3] || msbMac[4] || msbMac[5])) {
+            macFound = true;
+            if (g_activeBrand != BRAND_DJI) {
+                selectCameraBrand(BRAND_DJI, false);
+            }
+        }
+    }
 
     if (!macFound) {
         addLog("WAKE", "No saved camera MAC found; pair camera once before WKP wake");
-        startBleScan();
+        if (g_bootMode == MODE_FLIGHT && g_activeBrand != BRAND_INSTA360) {
+            startBleScan();
+        }
         return;
     }
 
+    if (!hasTargetAddress && macFound) {
+        char typeKey[20];
+        snprintf(typeKey, sizeof(typeKey), "%s_t", getBrandMacKey(g_activeBrand));
+        uint8_t addrType = prefs.getUChar(typeKey, BLE_ADDR_PUBLIC);
+        char macStr[18];
+        snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 msbMac[0], msbMac[1], msbMac[2], msbMac[3], msbMac[4], msbMac[5]);
+        targetAddress = NimBLEAddress(macStr, addrType);
+        hasTargetAddress = true;
+        hasSavedMacForActiveBrand = true;
+    }
+
+    memcpy(s_wkpMsbMac, msbMac, 6);
+    s_wkpSwappedToMsb = false;
+    s_wkpScanStarted = false;
+
+    NimBLEScan* pScan = NimBLEDevice::getScan();
+    if (pScan && pScan->isScanning()) {
+        pScan->stop();
+        delay(20);
+    }
+
+    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+    if (!pAdv) return;
+
+    if (pAdv->isAdvertising()) {
+        pAdv->stop();
+        delay(20);
+    }
+    pAdv->reset();
+    pAdv->setConnectableMode(BLE_GAP_CONN_MODE_UND);
+    pAdv->enableScanResponse(false);
+
+    // Phase 1: Target camera MAC LSB first (reverse byte order as per DJI R-SDK)
     uint8_t wkpPayload[9];
     wkpPayload[0] = 'W';
     wkpPayload[1] = 'K';
     wkpPayload[2] = 'P';
     for (int i = 0; i < 6; i++) {
-        wkpPayload[3 + i] = msbMac[5 - i]; // Target camera MAC LSB first
+        wkpPayload[3 + i] = msbMac[5 - i]; // LSB first
     }
 
     NimBLEAdvertisementData advData;
     advData.setManufacturerData(wkpPayload, sizeof(wkpPayload));
     pAdv->setAdvertisementData(advData);
 
-    pAdv->setMinInterval(32);
-    pAdv->setMaxInterval(48);
+    pAdv->setMinInterval(32); // 20ms
+    pAdv->setMaxInterval(48); // 30ms
 
-    pAdv->start();
+    bool ok = pAdv->start();
+    if (!ok) {
+        pAdv->setMinInterval(160);
+        pAdv->setMaxInterval(160);
+        ok = pAdv->start();
+    }
     isBroadcastingWake = true;
     wakeBroadcastStartMs = millis();
 
     char buf[128];
-    snprintf(buf, sizeof(buf), "Broadcasting WKP wake for %02X:%02X:%02X:%02X:%02X:%02X (2.5s)",
-             msbMac[0], msbMac[1], msbMac[2], msbMac[3], msbMac[4], msbMac[5]);
+    snprintf(buf, sizeof(buf), "Broadcasting WKP wake for %02X:%02X:%02X:%02X:%02X:%02X (3.0s) [ok=%d]",
+             msbMac[0], msbMac[1], msbMac[2], msbMac[3], msbMac[4], msbMac[5], ok ? 1 : 0);
     addLog("WAKE", buf);
 }
 
 static void stopWkpWakeBroadcast() {
+    bool returningIdle = (connStep == CONN_IDLE);
     NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
     if (pAdv) {
-        pAdv->stop();
+        if (pAdv->isAdvertising()) {
+            pAdv->stop();
+        }
+        if (returningIdle) {
+            pAdv->reset();
+        }
     }
     isBroadcastingWake = false;
-    addLog("WAKE", "Wake broadcast completed. Resuming scan...");
+    s_wkpSwappedToMsb = false;
+    s_wkpScanStarted = false;
+    addLog("WAKE", returningIdle
+           ? "Wake broadcast completed. Resuming scan..."
+           : "Camera awake detected during WKP -> Connecting immediately...");
 
-    // Restore NUS advertising payload
-    if (g_bootMode == MODE_BF_BLE_BRIDGE || (g_bootMode == MODE_FLIGHT && g_activeBrand != BRAND_INSTA360)) {
-        configureNusAdvertising();
+    NimBLEScan* pScan = NimBLEDevice::getScan();
+    if (pScan) {
+        pScan->setDuplicateFilter(true);
     }
 
-    if (g_activeBrand != BRAND_INSTA360) {
-        g_bleScanAllowedAfterMs = 0;
-        startBleScan();
+    if (returningIdle) {
+        // Restore NUS advertising payload only when returning to idle search
+        if (g_bootMode == MODE_BF_BLE_BRIDGE || (g_bootMode == MODE_FLIGHT && g_activeBrand != BRAND_INSTA360)) {
+            configureNusAdvertising();
+        }
+
+        if (g_bootMode == MODE_FLIGHT && g_activeBrand != BRAND_INSTA360) {
+            s_cameraConnBackoffUntilMs = 0;
+            g_bleScanAllowedAfterMs = 0;
+            lastScanRestartMs = 0;
+            startBleScan();
+        }
+    }
+}
+
+static void handleWkpWakeLoop(uint32_t now) {
+    if (!isBroadcastingWake) return;
+
+    // Stop WKP immediately once ScanCallbacks detects the camera's awake advertisement
+    if (connStep != CONN_IDLE) {
+        stopWkpWakeBroadcast();
+        return;
+    }
+
+    // Refresh wall clock to prevent unsigned underflow if startWkpWakeBroadcast() ran earlier in this loop() pass
+    now = millis();
+    int32_t elapsed = (int32_t)(now - wakeBroadcastStartMs);
+    if (elapsed < 0) return;
+
+    // After initial 300ms pure WKP burst, scan concurrently so we catch the camera the instant it wakes
+    if (!s_wkpScanStarted && (elapsed >= 300)) {
+        s_wkpScanStarted = true;
+        if (g_bootMode == MODE_FLIGHT && g_activeBrand != BRAND_INSTA360 && !g_bfBleConnected) {
+            NimBLEScan* pScan = NimBLEDevice::getScan();
+            if (pScan && !pScan->isScanning()) {
+                pScan->setActiveScan(true);
+                pScan->setDuplicateFilter(false); // Prevent pre-wake standby beacons from suppressing awake adv
+                pScan->setInterval(48);           // 30ms scan interval
+                pScan->setWindow(24);             // 15ms scan window (50% scan, 50% WKP airtime)
+                pScan->setMaxResults(16);
+                pScan->start(3000, false);
+            }
+        }
+    }
+
+    // After 2000ms of continuous LSB-first WKP (DJI R-SDK spec), alternate cleanly to MSB-first order
+    if (!s_wkpSwappedToMsb && (elapsed >= 2000)) {
+        s_wkpSwappedToMsb = true;
+        NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+        if (pAdv) {
+            uint8_t wkpPayloadMsb[9];
+            wkpPayloadMsb[0] = 'W';
+            wkpPayloadMsb[1] = 'K';
+            wkpPayloadMsb[2] = 'P';
+            for (int i = 0; i < 6; i++) {
+                wkpPayloadMsb[3 + i] = s_wkpMsbMac[i]; // MSB first
+            }
+            if (pAdv->isAdvertising()) {
+                pAdv->stop();
+                delay(20);
+            }
+            NimBLEAdvertisementData advDataMsb;
+            advDataMsb.setManufacturerData(wkpPayloadMsb, sizeof(wkpPayloadMsb));
+            pAdv->setAdvertisementData(advDataMsb);
+            pAdv->start();
+        }
+    }
+
+    if (elapsed >= 3000) {
+        stopWkpWakeBroadcast();
     }
 }
 
@@ -1924,8 +2134,12 @@ void setup() {
     g_auxRecChannel = prefs.getUChar("aux_ch", 0);
     if (g_auxRecChannel > 8) g_auxRecChannel = 0;
 
-    g_activeBrand = (CameraBrand)prefs.getUChar("brand", (uint8_t)BRAND_GOPRO);
-    if (g_activeBrand >= BRAND_COUNT) g_activeBrand = BRAND_GOPRO;
+    uint8_t dfltBrand = BRAND_DJI;
+    if (prefs.isKey("mac_gopro") && !prefs.isKey("mac_dji")) {
+        dfltBrand = BRAND_GOPRO;
+    }
+    g_activeBrand = (CameraBrand)prefs.getUChar("brand", dfltBrand);
+    if (g_activeBrand >= BRAND_COUNT) g_activeBrand = BRAND_DJI;
     g_activeDriver = g_drivers[g_activeBrand];
 
     // Load saved MAC for active brand
@@ -1999,6 +2213,8 @@ void setup() {
         addLog("BOOT", "=== DEDICATED BETAFLIGHT BLE BRIDGE MODE ACTIVE ===");
         addLog("BOOT", "Connect Betaflight Configurator (app.betaflight.com) via Web Bluetooth to 'OpenLogic_BF'");
         addLog("BOOT", "Wi-Fi radio turned off; Camera BLE paused");
+        WiFi.persistent(false);
+        WiFi.mode(WIFI_OFF);
 
         g_bfBridge.begin(true); // Passthrough / pause internal MSP polling
 
@@ -2013,6 +2229,8 @@ void setup() {
         // ====================================================================
         addLog("BOOT", "=== BLE FLIGHT MODE ACTIVE ===");
         addLog("BOOT", "Wi-Fi radio turned off for zero RF contention");
+        WiFi.persistent(false);
+        WiFi.mode(WIFI_OFF);
 
         g_bfBridge.begin(false); // Normal MSP arm & AUX monitoring
 
@@ -2053,6 +2271,7 @@ void setup() {
             NimBLEDevice::init(BLE_DEVICE_NAME);
             NimBLEDevice::setPower(9);
             NimBLEDevice::setMTU(247);
+            ble_gap_set_prefered_default_le_phy(BLE_GAP_LE_PHY_1M_MASK, BLE_GAP_LE_PHY_1M_MASK);
 
             setupBetaflightBleServer(false);
 
@@ -2098,7 +2317,7 @@ static void runArmAndAuxController(uint32_t now) {
     // 1. Arm Trigger (sampled on each MSP_STATUS packet, debounced over 2 consecutive reads)
     if (fcConnected) {
         uint32_t statusMs = g_bfBridge.getLastStatusMs();
-        if (statusMs != s_lastStatusSampleMs) {
+        if (statusMs != 0 && statusMs != s_lastStatusSampleMs) {
             s_lastStatusSampleMs = statusMs;
 
             if (isArmed == s_lastCandidateArmed) {
@@ -2108,12 +2327,17 @@ static void runArmAndAuxController(uint32_t now) {
                 s_armCandidateCount = 1;
             }
 
-            if (s_armCandidateCount >= 2 && s_lastArmed != isArmed) {
+            if (s_lastArmed != isArmed && (isArmed || s_armCandidateCount >= 2)) {
                 s_lastArmed = isArmed;
 
                 if (s_lastArmed) {
                     // Disarmed -> Armed edge
                     s_disarmTargetMs = 0; // Cancel pending stop immediately
+                    char edgeBuf[80];
+                    snprintf(edgeBuf, sizeof(edgeBuf), "ARM edge: autoRec=%d camReady=%d brand=%d hasMac=%d",
+                             g_autoRecOnArm ? 1 : 0, camReady ? 1 : 0, (int)g_activeBrand,
+                             (hasTargetAddress || hasSavedMacForActiveBrand) ? 1 : 0);
+                    addLog("ARM", edgeBuf);
                     if (g_autoRecOnArm) {
                         if (camReady) {
                             if ((g_activeBrand == BRAND_INSTA360 && !s_armRecStarted) ||
@@ -2122,9 +2346,9 @@ static void runArmAndAuxController(uint32_t now) {
                                 s_armRecStarted = true;
                                 addLog("ARM", "FC Armed -> Start Recording");
                             }
-                        } else if (g_activeBrand == BRAND_DJI && hasTargetAddress) {
+                        } else if (g_activeBrand == BRAND_DJI && (hasTargetAddress || hasSavedMacForActiveBrand)) {
                             g_pendingRecordOnWake = true;
-                            g_pendingRecordExpireMs = now + 15000;
+                            g_pendingRecordExpireMs = now + 20000;
                             s_armRecStarted = true;
                             enqueueCommand(CMD_WAKE);
                             addLog("ARM", "Camera asleep -> WKP wake + auto-record");
@@ -2171,9 +2395,9 @@ static void runArmAndAuxController(uint32_t now) {
                         s_auxRecStarted = true;
                         addLog("AUX", "AUX switch HIGH -> Start Recording");
                     }
-                } else if (g_activeBrand == BRAND_DJI && hasTargetAddress) {
+                } else if (g_activeBrand == BRAND_DJI && (hasTargetAddress || hasSavedMacForActiveBrand)) {
                     g_pendingRecordOnWake = true;
-                    g_pendingRecordExpireMs = now + 15000;
+                    g_pendingRecordExpireMs = now + 20000;
                     s_auxRecStarted = true;
                     enqueueCommand(CMD_WAKE);
                     addLog("AUX", "Camera asleep -> WKP wake + auto-record");
@@ -2336,7 +2560,7 @@ void loop() {
     }
 
     // 2. Control NUS Advertising in Flight Mode for DJI/GoPro
-    if (g_activeBrand != BRAND_INSTA360) {
+    if (g_activeBrand != BRAND_INSTA360 && !isBroadcastingWake) {
         CameraTelemetry t{};
         if (g_activeDriver) {
             portENTER_CRITICAL(&g_telemetryMux);
@@ -2380,9 +2604,7 @@ void loop() {
                     }
                 }
                 if (wasScanning) {
-                    pScan->setInterval(160);
-                    pScan->setWindow(32);
-                    pScan->start(2000, false);
+                    startBleScan();
                 }
             } else if (!shouldAdvNus && pAdv->isAdvertising()) {
                 pAdv->stop();
@@ -2438,7 +2660,9 @@ void loop() {
         s_diagPairedLoggedThisSession = false;
         g_camPairedAtMs = 0;
         g_lastDisconnectMs = millis();
-        s_cameraConnBackoffUntilMs = now + 200UL;
+        bool wasShutdown = s_expectingShutdownDisconnect;
+        s_expectingShutdownDisconnect = false;
+        s_cameraConnBackoffUntilMs = now + (wasShutdown ? 2200UL : 200UL);
         s_instaMacSaveAtMs = 0;
         g_explicitSleepRequested = false;
 
@@ -2480,15 +2704,16 @@ void loop() {
         }
     }
 
-    // 6. Handle WKP Wake Broadcast Timeout (2.5s)
+    // 6. Handle WKP Wake Broadcast Timeout / Early Camera Detection
     if (isBroadcastingWake) {
-        if (now - wakeBroadcastStartMs >= 2500) {
-            stopWkpWakeBroadcast();
+        handleWkpWakeLoop(millis());
+        if (isBroadcastingWake) {
+            g_bfBridge.loop();
+            runArmAndAuxController(millis());
+            delay(2);
+            return;
         }
-        g_bfBridge.loop();
-        runArmAndAuxController(now);
-        delay(5);
-        return;
+        now = millis();
     }
 
     // 7. Run Non-Blocking Connection State Machine (Central mode)
@@ -2505,26 +2730,29 @@ void loop() {
             if (pClient && pClient->isConnected()) {
                 g_explicitSleepRequested = false;
                 g_cameraAsleep = false;
+                s_expectingShutdownDisconnect = true;
+                g_lastDisconnectMs = now;
                 addLog("BLE", "Camera shutdown / sleep confirmed -> Closing link");
                 pClient->disconnect();
-                g_lastDisconnectReason = 0x213; // Remote User Terminated Connection
-                g_disconnectPending = true;
             }
         }
 
-        // Telemetry timeout watchdog: if paired but no telemetry received for > 1.8s
+        // Telemetry silence watchdog:
+        // - 2.5s in CAM_CONNECTING (3 handshake retries failed)
+        // - 3.5s in CAM_PAIRED/CAM_RECORDING (safely past DjiDriver's 2.0s retry window)
         if (g_activeBrand == BRAND_DJI && pClient && pClient->isConnected()) {
             CameraTelemetry curT{};
             portENTER_CRITICAL(&g_telemetryMux);
             curT = g_activeDriver->getTelemetry();
             portEXIT_CRITICAL(&g_telemetryMux);
-            if (curT.state == CAM_PAIRED || curT.state == CAM_RECORDING) {
-                uint32_t lastTelem = g_activeDriver->getLastTelemetryMs();
-                if (lastTelem > 0 && (now - lastTelem >= 1800UL)) {
-                    addLog("BLE", "Telemetry timeout (1.8s without packets) -> Dropping dead link");
+            uint32_t lastTelem = g_activeDriver->getLastTelemetryMs();
+            if (lastTelem > 0) {
+                int32_t silenceMs = (int32_t)(millis() - lastTelem);
+                if ((curT.state == CAM_CONNECTING && silenceMs >= 2500) ||
+                    ((curT.state == CAM_PAIRED || curT.state == CAM_RECORDING) && silenceMs >= 3500)) {
+                    g_lastDisconnectMs = millis();
+                    addLog("BLE", "Telemetry timeout -> Dropping dead link");
                     pClient->disconnect();
-                    g_lastDisconnectReason = 0x208; // Connection Timeout
-                    g_disconnectPending = true;
                 }
             }
         }
@@ -2542,6 +2770,7 @@ void loop() {
             g_cameraAsleep = false;
             if (!s_diagPairedLoggedThisSession) {
                 s_diagPairedLoggedThisSession = true;
+                addLog("BLE", "Camera paired & ready");
                 char diagEvt[64];
                 snprintf(diagEvt, sizeof(diagEvt), "P@%lu", (unsigned long)now);
                 appendDiagEvent(diagEvt, false);
@@ -2568,7 +2797,7 @@ void loop() {
     } else if (g_activeBrand != BRAND_INSTA360) {
         if ((!pClient || !pClient->isConnected()) && connStep == CONN_IDLE && !isBroadcastingWake) {
             NimBLEScan* pScan = NimBLEDevice::getScan();
-            if (!pScan->isScanning() && (now - lastScanRestartMs >= 100)) {
+            if (!pScan->isScanning() && (now - lastScanRestartMs >= 15)) {
                 startBleScan();
             }
         }
@@ -2587,6 +2816,8 @@ void loop() {
                 pServer->updateConnParams(g_bfBleConnHandle, 6, 12, 0, 400);
             }
         }
+        vTaskDelay(1);
+    } else if (connStep != CONN_IDLE) {
         vTaskDelay(1);
     } else {
         delay(2);

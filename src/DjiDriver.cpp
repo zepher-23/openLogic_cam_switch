@@ -621,7 +621,7 @@ void DjiDriver::updateLoop(uint32_t nowMs) {
     }
 
     // 2. Post-Auth Initialization: Subscribe to 2Hz live telemetry push immediately
-    if (m_postAuthInitNeeded && (nowMs - m_postAuthMs >= 300)) {
+    if (m_postAuthInitNeeded && (nowMs - m_postAuthMs >= 80)) {
         m_postAuthInitNeeded = false;
         m_telemetry.state = CAM_PAIRED;
         m_lastRetryMs = nowMs;
